@@ -1029,6 +1029,23 @@ async function handleTrackingHit(req, res, linkId) {
             return res.status(410).send('This link is currently paused');
         }
 
+        // 1c. Check if link has expired (expiresAt is optional, NULL means never expires)
+        if (link.expiresAt) {
+            const now = new Date();
+            const expiryDate = new Date(link.expiresAt);
+            if (now > expiryDate) {
+                console.log(chalk.yellow(`[TRACKING] Link expired: ${linkId} (expired at ${link.expiresAt})`));
+                return res.status(410).send('This link has expired');
+            }
+        }
+
+        // 1d. Check if link is single-use and already used
+        // For single-use links: first click (human or bot) marks it as used
+        if (link.singleUse === 1 && link.usedAt) {
+            console.log(chalk.yellow(`[TRACKING] Single-use link already used: ${linkId} (used at ${link.usedAt})`));
+            return res.status(410).send('This link has already been used');
+        }
+
         // 2. Bot detection + Geo lookup (extracted helper)
         const { isBot, botResult, country } = await detectBotAndGeo(req);
         
@@ -1091,6 +1108,21 @@ async function handleTrackingHit(req, res, linkId) {
             linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
             botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
         });
+
+        // 6b. Mark single-use link as used (only for human clicks, not bot clicks)
+        // Bots already went to safe chain above, so this only runs for humans
+        if (link.singleUse === 1 && !link.usedAt) {
+            try {
+                const db = await getDb();
+                await db.run(
+                    'UPDATE links SET usedAt = CURRENT_TIMESTAMP WHERE id = ? AND usedAt IS NULL',
+                    [linkId]
+                );
+                console.log(chalk.cyan(`[TRACKING] Marked single-use link as used: ${linkId}`));
+            } catch (e) {
+                console.warn(chalk.yellow(`[TRACKING] Failed to mark single-use link: ${e.message}`));
+            }
+        }
 
         // 7. WebSocket Broadcast
         if (link.ownerId) {
@@ -1547,7 +1579,7 @@ app.post('/api/links/bulk-delete', apiLimiter, authenticateToken, async (req, re
 // ==================== FIXED: POST /api/links (WITH DOMAIN PRIORITIZATION) ====================
 app.post('/api/links', authenticateToken, async (req, res) => {
     try {
-        const { rotations, expiresAt, customDomain, templateId } = req.body;
+        const { rotations, expiresAt, customDomain, templateId, singleUse } = req.body;
         
         // 1. Determine the base domain to use
         let publicDomain = customDomain;
@@ -1571,7 +1603,8 @@ app.post('/api/links', authenticateToken, async (req, res) => {
             publicDomain: publicDomain,
             expiresAt,
             rotations,
-            templateId: templateId || undefined
+            templateId: templateId || undefined,
+            singleUse: singleUse || false
         });
         
         res.json(result);
@@ -1656,7 +1689,7 @@ ${linkRows}
 
 app.post('/api/links/batch', apiLimiter, authenticateToken, async (req, res) => {
     try {
-        const { destinations, expiresAt, customDomain, templateId } = req.body;
+        const { destinations, expiresAt, customDomain, templateId, singleUse } = req.body;
 
         if (!destinations || !Array.isArray(destinations) || destinations.length === 0) {
             return res.status(400).json({ error: 'destinations must be a non-empty array of objects with a "url" property.' });
@@ -1692,7 +1725,8 @@ app.post('/api/links/batch', apiLimiter, authenticateToken, async (req, res) => 
             publicDomain,
             expiresAt,
             destinations,
-            templateId: templateId || undefined
+            templateId: templateId || undefined,
+            singleUse: singleUse || false
         });
 
         console.log(chalk.green(`[BATCH-GEN] ✓ Batch ${result.batchId}: ${result.links.length} links created`));

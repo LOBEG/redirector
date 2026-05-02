@@ -13,7 +13,7 @@ const CACHE_TTL = {
 };
 
 const linkStore = {
-    async createLinkWithRotations({ ownerId, publicDomain, expiresAt, rotations, templateId }) {
+    async createLinkWithRotations({ ownerId, publicDomain, expiresAt, rotations, templateId, singleUse }) {
         const db = await getDb();
         
         const firstUrl = rotations[0]?.url;
@@ -23,11 +23,11 @@ const linkStore = {
 
         await db.run('BEGIN TRANSACTION');
         try {
-            // MODIFIED: Added templateId to the INSERT statement
+            // MODIFIED: Added templateId and singleUse to the INSERT statement
             await db.run(
-                `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId) 
-                 VALUES (?, ?, ?, ?, ?, 0, 0, ?)`,
-                [internalId, ownerId, googleAdsUrl, firstUrl, expiresAt, templateId]
+                `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, singleUse) 
+                 VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+                [internalId, ownerId, googleAdsUrl, firstUrl, expiresAt, templateId, singleUse ? 1 : 0]
             );
 
             for (const rotation of rotations) {
@@ -49,7 +49,8 @@ const linkStore = {
                 expiresAt, 
                 clicks: 0, 
                 botClicks: 0,
-                templateId
+                templateId,
+                singleUse: singleUse ? 1 : 0
             };
         } catch (error) {
             await db.run('ROLLBACK');
@@ -717,9 +718,10 @@ const linkStore = {
      * @param {string} options.expiresAt - Expiration datetime
      * @param {Array<{url: string, tags?: string, notes?: string}>} options.destinations - Array of destination URLs
      * @param {number} [options.templateId] - Optional template ID
+     * @param {boolean} [options.singleUse] - Optional single-use mode
      * @returns {Promise<{batchId: string, links: Array}>}
      */
-    async createBatchLinks({ ownerId, publicDomain, expiresAt, destinations, templateId }) {
+    async createBatchLinks({ ownerId, publicDomain, expiresAt, destinations, templateId, singleUse }) {
         const db = await getDb();
 
         if (!destinations || !Array.isArray(destinations) || destinations.length === 0) {
@@ -740,9 +742,9 @@ const linkStore = {
                 const { googleAdsUrl, internalId } = googleAdsRedirector.createRedirect(url, publicDomain);
 
                 await db.run(
-                    `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, batchId, tags, notes) 
-                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
-                    [internalId, ownerId, googleAdsUrl, url, expiresAt, templateId || null, batchId, dest.tags || null, dest.notes || null]
+                    `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, batchId, tags, notes, singleUse) 
+                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`,
+                    [internalId, ownerId, googleAdsUrl, url, expiresAt, templateId || null, batchId, dest.tags || null, dest.notes || null, singleUse ? 1 : 0]
                 );
 
                 await db.run(
@@ -762,7 +764,8 @@ const linkStore = {
                     templateId: templateId || null,
                     batchId,
                     tags: dest.tags || null,
-                    notes: dest.notes || null
+                    notes: dest.notes || null,
+                    singleUse: singleUse ? 1 : 0
                 });
             }
 

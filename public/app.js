@@ -44,6 +44,7 @@ const app = {
             addDestinationBtn: document.getElementById('add-destination-btn'),
             licenseKeyInput: document.getElementById('license-key-input'),
             expiresAtInput: document.getElementById('expires-at-input'),
+            singleUseInput: document.getElementById('single-use-input'),
             customDomainSelect: document.getElementById('custom-domain-select'),
             linkTemplateSelect: document.getElementById('link-template-select'),
             createError: document.getElementById('create-error'),
@@ -677,6 +678,7 @@ const app = {
             expiresAt: new Date(this.ui.expiresAtInput.value).toISOString(),
             customDomain: this.ui.customDomainSelect.value || undefined,
             templateId: this.ui.linkTemplateSelect.value ? parseInt(this.ui.linkTemplateSelect.value) : undefined,
+            singleUse: this.ui.singleUseInput ? this.ui.singleUseInput.checked : false
         };
         try {
             const newLink = await this.handleApiCall('/api/links', {

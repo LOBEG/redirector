@@ -163,7 +163,7 @@ async function initializeDatabase() {
         `);
         const migMeta = await db.get('SELECT version FROM _migration_meta WHERE id = 1');
         const currentVersion = migMeta ? migMeta.version : 0;
-        const TARGET_VERSION = 8; // Increment when adding new migrations
+        const TARGET_VERSION = 9; // Increment when adding new migrations
 
         if (currentVersion < TARGET_VERSION) {
             console.log(chalk.yellow(`[DATABASE] Checking for necessary schema migrations (v${currentVersion} -> v${TARGET_VERSION})...`));
@@ -306,6 +306,19 @@ async function initializeDatabase() {
                     if (!clickCols.has('botSignals')) {
                         console.log(chalk.cyan('[DATABASE] Migrating: Adding "botSignals" column to clicks...'));
                         await db.exec(`ALTER TABLE clicks ADD COLUMN botSignals TEXT DEFAULT NULL`);
+                    }
+
+                    // FIX 11 (v9): Link expiration enforcement and optional single-use tokens
+                    // - singleUse: when TRUE, link can only be clicked once (prevents scanner replay)
+                    // - usedAt: timestamp of first click (NULL if not yet used)
+                    // Fully backward compatible: existing links default to singleUse=0, usedAt=NULL
+                    if (!linkCols.has('singleUse')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "singleUse" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN singleUse INTEGER DEFAULT 0`);
+                    }
+                    if (!linkCols.has('usedAt')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "usedAt" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN usedAt TEXT DEFAULT NULL`);
                     }
 
                     // Update migration version
