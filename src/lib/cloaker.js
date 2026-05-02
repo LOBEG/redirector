@@ -17,11 +17,11 @@ try {
 
 // Generate a short alphanumeric token (used for randomized JS variable names so
 // every served HTML page differs and cannot be statically fingerprinted).
+// Uses `crypto.randomInt` to avoid the modulo-bias caused by `randomBytes()[i] % 52`.
 function _rndId(len = 6) {
     const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
     let out = '';
-    const bytes = crypto.randomBytes(len);
-    for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
+    for (let i = 0; i < len; i++) out += alphabet[crypto.randomInt(0, alphabet.length)];
     return out;
 }
 
@@ -364,7 +364,8 @@ html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#
                 if (dbg) {
                     var rend = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').toLowerCase();
                     var vend = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '').toLowerCase();
-                    if (rend.indexOf('swiftshader') !== -1 || vend.indexOf('swiftshader') !== -1) s += 60;
+                    var isSwiftShader = rend.indexOf('swiftshader') !== -1 || vend.indexOf('swiftshader') !== -1;
+                    if (isSwiftShader) s += 60;
                     if (rend.indexOf('llvmpipe') !== -1) s += 40;
                 }
             }

