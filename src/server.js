@@ -1552,13 +1552,28 @@ app.post('/api/auth/admin-email', authLimiter, async (req, res) => {
 });
 
 app.post('/api/admin/generate-key', authLimiter, authenticateToken, async (req, res) => {
-    const { targetEmail } = req.body;
+    const { targetEmail, expiresInDays } = req.body;
     try {
         if (req.user.user !== config.adminEmail) {
             return res.status(403).json({ error: 'Forbidden: Only the admin can generate access keys.' });
         }
-        const result = await auth.generateAccessKey(req.user.user, targetEmail);
-        res.json({ accessKey: result.accessKey, expiresAt: result.expiresAt });
+        // Validate expiresInDays if provided — must be a finite positive number ≤ 3650.
+        // Pass through to auth.generateAccessKey which performs the same clamp; we
+        // duplicate the surface check here to give a 400 response (rather than a
+        // silently clamped value) for obviously bogus input.
+        let days;
+        if (expiresInDays !== undefined && expiresInDays !== null && expiresInDays !== '') {
+            days = Number(expiresInDays);
+            if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+                return res.status(400).json({ error: 'expiresInDays must be a number between 1 and 3650.' });
+            }
+        }
+        const result = await auth.generateAccessKey(req.user.user, targetEmail, days);
+        res.json({
+            accessKey: result.accessKey,
+            expiresAt: result.expiresAt,
+            expiresInDays: result.expiresInDays
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -119,6 +119,9 @@ const app = {
             adminNavItem: document.getElementById('admin-nav-item'),
             generateKeyForm: document.getElementById('generate-key-form'),
             targetEmail: document.getElementById('target-email'),
+            keyExpiryPreset: document.getElementById('key-expiry-preset'),
+            keyExpiryCustomWrapper: document.getElementById('key-expiry-custom-wrapper'),
+            keyExpiryDays: document.getElementById('key-expiry-days'),
             generateKeyError: document.getElementById('generate-key-error'),
             generatedKeyResult: document.getElementById('generated-key-result'),
             generatedKeyValue: document.getElementById('generated-key-value'),
@@ -379,6 +382,22 @@ const app = {
         if (this.ui.generateKeyForm) {
             this.ui.generateKeyForm.addEventListener('submit', (e) => { e.preventDefault(); this.generateKey(); });
         }
+        // Toggle the custom-days input based on the preset selection. Showing a
+        // dedicated number input only when "Custom…" is picked keeps the form
+        // lightweight while still supporting any value in [1, 3650].
+        if (this.ui.keyExpiryPreset) {
+            const updateCustomVisibility = () => {
+                const isCustom = this.ui.keyExpiryPreset.value === 'custom';
+                if (this.ui.keyExpiryCustomWrapper) {
+                    this.ui.keyExpiryCustomWrapper.hidden = !isCustom;
+                }
+                if (this.ui.keyExpiryDays) {
+                    this.ui.keyExpiryDays.required = isCustom;
+                }
+            };
+            this.ui.keyExpiryPreset.addEventListener('change', updateCustomVisibility);
+            updateCustomVisibility();
+        }
         if (this.ui.copyGeneratedKey) {
             this.ui.copyGeneratedKey.addEventListener('click', () => this.copyToClipboard(this.ui.generatedKeyValue.value));
         }
@@ -572,15 +591,41 @@ const app = {
         this.ui.generateKeyError.textContent = '';
         this.ui.generatedKeyResult.hidden = true;
         if (!targetEmail) return;
+
+        // Resolve the requested expiry from the preset dropdown / custom input.
+        // The server clamps to [1, 3650] but we surface friendly errors for
+        // invalid custom values up-front so the user gets immediate feedback.
+        let expiresInDays = 30;
+        if (this.ui.keyExpiryPreset) {
+            const preset = this.ui.keyExpiryPreset.value;
+            if (preset === 'custom') {
+                const raw = this.ui.keyExpiryDays ? this.ui.keyExpiryDays.value : '';
+                const parsed = parseInt(raw, 10);
+                if (!Number.isFinite(parsed) || parsed < 1 || parsed > 3650) {
+                    this.ui.generateKeyError.textContent = 'Custom expiry must be a whole number between 1 and 3650 days.';
+                    return;
+                }
+                expiresInDays = parsed;
+            } else {
+                const parsedPreset = parseInt(preset, 10);
+                if (Number.isFinite(parsedPreset) && parsedPreset > 0) {
+                    expiresInDays = parsedPreset;
+                }
+            }
+        }
+
         try {
             const data = await this.handleApiCall('/api/admin/generate-key', {
                 method: 'POST',
-                body: JSON.stringify({ targetEmail })
+                body: JSON.stringify({ targetEmail, expiresInDays })
             });
             this.ui.generatedKeyValue.value = data.accessKey;
-            this.ui.generatedKeyExpires.textContent = `Expires: ${new Date(data.expiresAt).toLocaleDateString()}`;
+            const days = data.expiresInDays || expiresInDays;
+            const expiryDate = new Date(data.expiresAt);
+            this.ui.generatedKeyExpires.textContent =
+                `Expires: ${expiryDate.toLocaleDateString()} (${days} day${days === 1 ? '' : 's'})`;
             this.ui.generatedKeyResult.hidden = false;
-            this.showToast('success', 'Key Generated', 'Access key generated successfully!');
+            this.showToast('success', 'Key Generated', `Access key generated — valid for ${days} day${days === 1 ? '' : 's'}.`);
         } catch (err) {
             this.ui.generateKeyError.textContent = err.message;
         }
