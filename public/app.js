@@ -214,6 +214,10 @@ const app = {
         if (this.ui.clearFeedBtn) {
             this.ui.clearFeedBtn.addEventListener('click', () => this.clearFeed());
         }
+        const refreshBotBtn = document.getElementById('refresh-bot-feed-btn');
+        if (refreshBotBtn) refreshBotBtn.addEventListener('click', () => this.refreshBotFeed());
+        const refreshHumanBtn = document.getElementById('refresh-human-feed-btn');
+        if (refreshHumanBtn) refreshHumanBtn.addEventListener('click', () => this.refreshHumanFeed());
         if (this.ui.analyticsModal) {
             this.ui.analyticsModal.addEventListener('click', (e) => {
                 if (e.target === this.ui.analyticsModal) this.closeAnalyticsModal();
@@ -580,7 +584,7 @@ const app = {
 
     async loadInitialData() {
         try {
-            const [links, domains, stats, shortLinks, shortLinkStats, templates, dashboardStats, rateSummary, geoSummary, topLinks, hourlyStats, userProfile] = await Promise.all([
+            const [links, domains, stats, shortLinks, shortLinkStats, templates, dashboardStats, rateSummary, geoSummary, topLinks, hourlyStats, userProfile, botFeed, humanFeed, threats, domainHealth] = await Promise.all([
                 this.handleApiCall('/api/links'),
                 this.handleApiCall('/api/domains'),
                 this.handleApiCall('/api/stats/clicks-by-day?days=14'),
@@ -593,6 +597,10 @@ const app = {
                 this.handleApiCall('/api/stats/top-links?limit=10').catch(() => null),
                 this.handleApiCall('/api/stats/hourly?hours=24').catch(() => null),
                 this.handleApiCall('/api/me').catch(() => null),
+                this.handleApiCall('/api/analytics/bot-feed?limit=25').catch(() => null),
+                this.handleApiCall('/api/analytics/human-feed?limit=25').catch(() => null),
+                this.handleApiCall('/api/analytics/threats/top?days=7').catch(() => null),
+                this.handleApiCall('/api/analytics/domain-health?days=1').catch(() => null),
             ]);
             this.links = links || [];
             this.domains = domains || [];
@@ -613,6 +621,10 @@ const app = {
             this.renderTopLinks(topLinks);
             this.renderHourlyChart(hourlyStats);
             this.updateUserProfile(userProfile);
+            this.renderBotFeed(botFeed);
+            this.renderHumanFeed(humanFeed);
+            this.renderTopThreats(threats);
+            this.renderDomainHealth(domainHealth);
         } catch (err) {
             console.error("Failed to load initial data:", err);
         }
@@ -1830,6 +1842,146 @@ const app = {
         });
         html += '</div>';
         this.ui.topLinksBody.innerHTML = html;
+    },
+
+    // ==================== BOT FEED / HUMAN FEED / THREATS / DOMAIN HEALTH ====================
+    _esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    },
+
+    _formatTime(ts) {
+        try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts); }
+    },
+
+    _shortUa(ua) {
+        if (!ua) return 'unknown';
+        const s = String(ua);
+        return s.length > 60 ? s.substring(0, 60) + '…' : s;
+    },
+
+    _confidenceBadge(c) {
+        const cls = c === 'high' ? 'rate-bot' : (c === 'medium' ? 'rate-total' : '');
+        return `<span class="rate-number ${cls}" style="font-size:0.7rem;padding:2px 6px;">${this._esc(c || 'low')}</span>`;
+    },
+
+    renderBotFeed(data) {
+        const el = document.getElementById('bot-feed-body');
+        if (!el) return;
+        if (!data || data.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No bot activity yet.</div>';
+            return;
+        }
+        let html = '<div class="bot-feed-list">';
+        data.forEach(b => {
+            const sigs = (b.botSignals || []).slice(0, 3).map(s => `<span class="rate-number" style="font-size:0.7rem;padding:2px 6px;background:#fee2e2;color:#991b1b;border-radius:4px;margin-right:4px;">${this._esc(s)}</span>`).join(' ');
+            html += `
+                <div class="feed-item bot" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px;border-bottom:1px solid rgba(148,163,184,0.15);">
+                    <div style="flex:1;min-width:0;">
+                        <div style="display:flex;gap:8px;align-items:center;font-size:0.85rem;font-weight:600;">
+                            🤖 ${this._esc(b.country || '??')} · score ${this._esc(b.botScore || 0)} · ${this._confidenceBadge(b.botConfidence)}
+                        </div>
+                        <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px;">${this._esc(this._shortUa(b.userAgent))}</div>
+                        <div style="margin-top:6px;">${sigs}</div>
+                    </div>
+                    <div style="font-size:0.7rem;color:#64748b;white-space:nowrap;">${this._formatTime(b.timestamp)}</div>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderHumanFeed(data) {
+        const el = document.getElementById('human-feed-body');
+        if (!el) return;
+        if (!data || data.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No human visits yet.</div>';
+            return;
+        }
+        let html = '<div class="human-feed-list">';
+        data.forEach(h => {
+            let host = '';
+            try { host = new URL(h.destinationUrlDesktop || h.destinationUrl || '').hostname; } catch (e) {}
+            html += `
+                <div class="feed-item human" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px;border-bottom:1px solid rgba(148,163,184,0.15);">
+                    <div style="flex:1;min-width:0;">
+                        <div style="font-size:0.85rem;font-weight:600;">
+                            👤 ${this._esc(h.country || '??')} ${h.isUnique ? '· <span style="color:#22c55e;">new visitor</span>' : ''}
+                        </div>
+                        <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px;">→ ${this._esc(host)}</div>
+                        <div style="font-size:0.7rem;color:#64748b;margin-top:2px;">${this._esc(this._shortUa(h.userAgent))}</div>
+                    </div>
+                    <div style="font-size:0.7rem;color:#64748b;white-space:nowrap;">${this._formatTime(h.timestamp)}</div>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderTopThreats(data) {
+        const el = document.getElementById('top-threats-body');
+        if (!el) return;
+        if (!data || (!data.topUserAgents?.length && !data.topCountries?.length && !data.topSignals?.length)) {
+            el.innerHTML = '<div class="empty-state-sm">No threats detected in this period.</div>';
+            return;
+        }
+        let html = '<div style="display:flex;flex-direction:column;gap:12px;">';
+        if (data.topSignals && data.topSignals.length) {
+            html += '<div><div style="font-weight:600;font-size:0.8rem;color:#94a3b8;margin-bottom:4px;">Top signals</div>';
+            data.topSignals.slice(0, 8).forEach(s => {
+                html += `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0;border-bottom:1px dashed rgba(148,163,184,0.1);">
+                    <span title="${this._esc(s.signal)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:75%;">${this._esc(s.signal)}</span>
+                    <strong>${this._esc(s.hits)}</strong>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        if (data.topCountries && data.topCountries.length) {
+            html += '<div><div style="font-weight:600;font-size:0.8rem;color:#94a3b8;margin-bottom:4px;">Bot countries</div>';
+            data.topCountries.slice(0, 8).forEach(c => {
+                html += `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0;border-bottom:1px dashed rgba(148,163,184,0.1);">
+                    <span>${this._esc(c.country)}</span><strong>${this._esc(c.hits)}</strong>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderDomainHealth(data) {
+        const el = document.getElementById('domain-health-body');
+        if (!el) return;
+        if (!data || !data.domains || data.domains.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No domain activity yet.</div>';
+            return;
+        }
+        const colors = { green: '#22c55e', amber: '#f59e0b', red: '#ef4444' };
+        let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
+        data.domains.forEach(d => {
+            const color = colors[d.status] || '#94a3b8';
+            html += `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-left:3px solid ${color};background:rgba(148,163,184,0.05);border-radius:4px;">
+                    <div>
+                        <div style="font-weight:600;font-size:0.85rem;">${this._esc(d.domain)}</div>
+                        <div style="font-size:0.7rem;color:#94a3b8;">${this._esc(d.totalClicks)} clicks · ${this._esc(d.botRatio)}% bots</div>
+                    </div>
+                    <span style="background:${color};color:#fff;font-size:0.7rem;padding:2px 8px;border-radius:10px;text-transform:uppercase;">${this._esc(d.status)}</span>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    async refreshBotFeed() {
+        const data = await this.handleApiCall('/api/analytics/bot-feed?limit=25').catch(() => null);
+        this.renderBotFeed(data);
+    },
+
+    async refreshHumanFeed() {
+        const data = await this.handleApiCall('/api/analytics/human-feed?limit=25').catch(() => null);
+        this.renderHumanFeed(data);
     },
 
     renderHourlyChart(data) {

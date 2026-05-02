@@ -330,6 +330,113 @@ app.use(async (req, res, next) => {
 // Static files AFTER the link domain gate — dashboard not served on link domain
 app.use(express.static(path.join(__dirname, '../public')));
 
+// ==================== ANTI-SCAN HARDENING ====================
+// Strict security headers for all tracking-domain responses to make the link
+// domain less appealing to scanners and reduce flagging risk.
+// Applied via middleware so every /tr/, /p/, /s/, /sr/ response carries them.
+app.use((req, res, next) => {
+    const p = req.path.toLowerCase();
+    // Only apply to tracking-style paths so dashboard endpoints keep their existing semantics.
+    if (p.startsWith('/tr/') || p.startsWith('/p/') || p.startsWith('/s/') || p.startsWith('/sr/')) {
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet, noimageindex');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), interest-cohort=(), browsing-topics=()');
+        // Use private no-store so intermediaries (Outlook safelink crawlers, Mimecast) don't cache the page
+        res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, proxy-revalidate');
+    }
+    next();
+});
+
+// ==================== ROBOTS.TXT (DISALLOW ALL ON LINK DOMAINS) ====================
+// Search engines and scanners often consult robots.txt before crawling. Returning
+// a strict "disallow everything" robots.txt on the link domain gives scanners a
+// legitimate signal that this is a private/restricted host and discourages
+// follow-up scans. Web (dashboard) domains keep default behavior.
+app.get('/robots.txt', (req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (isLinkDomainRequest(req)) {
+        return res.send('User-agent: *\nDisallow: /\n');
+    }
+    // Web/default — allow but block tracking paths
+    return res.send('User-agent: *\nDisallow: /tr/\nDisallow: /p/\nDisallow: /s/\nDisallow: /sr/\n');
+});
+
+// ==================== HONEYPOT / SCANNER PROBE PATHS ====================
+// Common paths that attackers and security scanners probe (looking for misconfigured
+// CMS installations, env files, or admin panels). Hitting any of these is a strong
+// indicator the request is automated. We respond with a benign 404 (not a redirect,
+// not a stack trace) so the scanner sees nothing interesting, and we record the IP
+// in an in-memory set so subsequent tracking hits from the same IP are pre-flagged.
+const HONEYPOT_PATHS = new Set([
+    '/wp-login.php', '/wp-admin', '/wp-admin/', '/wp-config.php',
+    '/.env', '/.env.local', '/.env.production', '/.git/config', '/.git/HEAD',
+    '/phpinfo.php', '/info.php', '/test.php',
+    '/admin.php', '/administrator', '/administrator/',
+    '/xmlrpc.php', '/wp-content/', '/wp-includes/',
+    '/.htaccess', '/.htpasswd', '/web.config',
+    '/config.json', '/config.yml', '/secrets.json',
+    '/.aws/credentials', '/.ssh/id_rsa',
+    '/server-status', '/server-info', '/.well-known/security.txt'
+]);
+
+// Track flagged scanner IPs (LRU-bounded). Exposed for botDetector via req-level marker.
+const _flaggedScannerIps = new Map(); // ip -> firstSeenTs
+const FLAGGED_IP_MAX = 10000;
+const FLAGGED_IP_TTL_MS = 24 * 60 * 60 * 1000;
+
+function _flagScannerIp(ip) {
+    if (!ip) return;
+    if (_flaggedScannerIps.size >= FLAGGED_IP_MAX) {
+        const oldest = _flaggedScannerIps.keys().next().value;
+        _flaggedScannerIps.delete(oldest);
+    }
+    _flaggedScannerIps.set(ip, Date.now());
+}
+function _isFlaggedScannerIp(ip) {
+    if (!ip) return false;
+    const ts = _flaggedScannerIps.get(ip);
+    if (!ts) return false;
+    if (Date.now() - ts > FLAGGED_IP_TTL_MS) {
+        _flaggedScannerIps.delete(ip);
+        return false;
+    }
+    return true;
+}
+
+// Periodic cleanup of stale honeypot entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, ts] of _flaggedScannerIps) {
+        if (now - ts > FLAGGED_IP_TTL_MS) _flaggedScannerIps.delete(ip);
+    }
+}, 60 * 60 * 1000).unref?.();
+
+// Mark request with honeypot flag for downstream handlers
+app.use((req, res, next) => {
+    const path = req.path.toLowerCase();
+    const ip = req.clientIp || req.ip;
+
+    if (HONEYPOT_PATHS.has(path) || path.startsWith('/wp-content/') || path.startsWith('/.git/')) {
+        _flagScannerIp(ip);
+        console.log(chalk.yellow(`[HONEYPOT] Scanner probe: ${path} from ${ip} (flagged)`));
+        // Serve a generic 404 — no useful info, no stack, no redirect
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        return res.status(404).send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not Found</title></head><body><h1>404</h1></body></html>');
+    }
+
+    // Decorate request so botDetector / fraud can use it
+    if (_isFlaggedScannerIp(ip)) {
+        req.headers['x-honeypot-flagged'] = '1';
+    }
+    next();
+});
+
+// Expose the flagged-scanner check for the dashboard analytics module
+app._flaggedScannerIps = _flaggedScannerIps;
+
 // ==================== COOKIE PARSER ====================
 function parseCookies(req) {
     const header = req.headers.cookie;
@@ -641,17 +748,45 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         .replace(/"/g, '\\"')
         .replace(/'/g, "\\'");
 
+    // Read fallback URL from config and prepare for safe JS embedding
+    const fallbackUrl = (config.redirector && config.redirector.fallbackUrl) || 'https://www.google.com';
+    const fallbackSafe = String(fallbackUrl).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+    // Randomize identifier names so each served HTML differs (anti-template fingerprint).
+    const rnd = (n) => {
+        const a = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        const b = require('crypto').randomBytes(n);
+        let s = '';
+        for (let i = 0; i < n; i++) s += a[b[i] % a.length];
+        return '_' + s;
+    };
+    const noiseId = rnd(10).slice(1);
+    // Random submit delay: 600-1500ms — replaces the fixed 3000ms tick
+    const submitJitter = 600 + Math.floor(Math.random() * 900);
+
     return `
-<script data-system-unlock="true">
+<script data-system-unlock="${noiseId}">
 (function() {
     'use strict';
     
     var P = JSON.parse("${payloadSafe}");
     var LID = "${linkId}";
     var CT = "${challengeToken}";
+    var FB = "${fallbackSafe}";
     var hasSubmitted = false;
-    
-    // Client-Side Bot Detection (Hardened v2 — scoring-based)
+    var hasInteraction = false;
+
+    // Track human interaction passively
+    function _onMove() { hasInteraction = true; }
+    try {
+        document.addEventListener('mousemove', _onMove, { passive: true, once: true });
+        document.addEventListener('pointermove', _onMove, { passive: true, once: true });
+        document.addEventListener('touchstart', _onMove, { passive: true, once: true });
+        document.addEventListener('keydown', _onMove, { passive: true, once: true });
+        document.addEventListener('scroll', _onMove, { passive: true, once: true });
+    } catch (e) { /* ignore */ }
+
+    // Client-Side Bot Detection (Hardened v3 — scoring-based with WebGL/timezone/iframe checks)
     function checkBot() {
         var s = 0;
         if (navigator.webdriver) s += 100;
@@ -663,6 +798,12 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         try { if (typeof Notification === 'undefined') s += 25; } catch(e) { s += 25; }
         if (screen.width === 0 || screen.height === 0) s += 80;
         if (screen.colorDepth && screen.colorDepth < 8) s += 40;
+        try { if (navigator.hardwareConcurrency === 0) s += 30; } catch(e) {}
+        try {
+            var tz = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || '';
+            if (!tz) s += 30;
+        } catch(e) { s += 30; }
+        try { if (window.top !== window.self) s += 50; } catch(e) { s += 50; }
         try {
             var cv = document.createElement('canvas');
             var cx = cv.getContext('2d');
@@ -674,10 +815,19 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             }
         } catch(e) { s += 60; }
         try {
-            var gl = document.createElement('canvas').getContext('webgl');
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
             if (!gl) s += 20;
+            else {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    var rend = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').toLowerCase();
+                    if (rend.indexOf('swiftshader') !== -1 || rend.indexOf('llvmpipe') !== -1) s += 60;
+                }
+            }
         } catch(e) { s += 20; }
         if (navigator.userAgent.indexOf('Chrome') !== -1 && !window.chrome) s += 40;
+        try { if (!(window.AudioContext || window.webkitAudioContext)) s += 20; } catch(e) { s += 20; }
         return s >= 50;
     }
 
@@ -687,6 +837,7 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             webdriver: !!navigator.webdriver,
             headless: navigator.userAgent.indexOf('HeadlessChrome') !== -1,
             jsExecuted: true,
+            hasInteraction: hasInteraction,
             languages: navigator.languages ? navigator.languages.length : 0,
             plugins: navigator.plugins ? navigator.plugins.length : -1,
             touchSupport: 'ontouchstart' in window,
@@ -694,8 +845,15 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             screenH: screen.height || 0,
             colorDepth: screen.colorDepth || 0,
             deviceMemory: navigator.deviceMemory || 0,
-            hardwareConcurrency: navigator.hardwareConcurrency || 0
+            hardwareConcurrency: navigator.hardwareConcurrency || 0,
+            iframed: false,
+            timezone: '',
+            audioCtx: false,
+            webglRenderer: ''
         };
+        try { s.iframed = window.top !== window.self; } catch (e) { s.iframed = true; }
+        try { s.timezone = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || ''; } catch(e) {}
+        try { s.audioCtx = !!(window.AudioContext || window.webkitAudioContext); } catch(e) {}
         try {
             var c = document.createElement('canvas');
             var ctx = c.getContext('2d');
@@ -706,9 +864,17 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             ctx.fillStyle = '#069';
             ctx.fillText('Test', 2, 15);
             s.canvasHash = c.toDataURL().length;
-        } catch(e) {
-            s.canvasHash = 0;
-        }
+        } catch(e) { s.canvasHash = 0; }
+        try {
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
+            if (gl) {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    s.webglRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').slice(0, 96);
+                }
+            }
+        } catch(e) {}
         return JSON.stringify(s);
     }
 
@@ -717,7 +883,9 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         
         if (checkBot()) {
             if (window.__sys_ops && window.__sys_ops.replace) {
-                window.__sys_ops.replace("https://www.google.com");
+                window.__sys_ops.replace(FB);
+            } else {
+                window.location.replace(FB);
             }
             return;
         }
@@ -732,6 +900,7 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             },
+            credentials: 'same-origin',
             body: JSON.stringify({
                 payload: JSON.stringify(P),
                 lid: LID,
@@ -762,9 +931,10 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             }
         })
         .catch(function(err) {
-            console.error("Unlock failed", err);
             if (window.__sys_ops && window.__sys_ops.replace) {
-                window.__sys_ops.replace("https://google.com");
+                window.__sys_ops.replace(FB);
+            } else {
+                window.location.replace(FB);
             }
         });
     }
@@ -774,12 +944,11 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         submitUnlock(); // Immediate submission
     });
 
-    // Auto-submit with a delay if it's a non-interactive template (e.g. just a loading bar)
-    // The delay lets the template display properly before the server-controlled redirect
-    // The "system-captcha-wrapper" class comes from the htmlTemplateProcessor
+    // Auto-submit with a randomised delay if it's a non-interactive template (e.g. just a loading bar)
+    // Random jitter (600-1500ms baseline + 3000ms display) defeats timing-based scanner pattern matching.
     if (document.querySelector('.system-captcha-wrapper') === null) {
         var safeTimeout = (window.__sys_ops && window.__sys_ops.setTimeout) ? window.__sys_ops.setTimeout : setTimeout;
-        function delayedSubmit() { safeTimeout(submitUnlock, 3000); }
+        function delayedSubmit() { safeTimeout(submitUnlock, ${submitJitter} + 1500); }
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
             delayedSubmit();
         } else {
@@ -875,7 +1044,8 @@ async function handleTrackingHit(req, res, linkId) {
             
             // Log the initial bot hit
             await linkStore.logClick({
-                linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl
+                linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+                botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
             });
 
             // Log bot redirect event
@@ -916,13 +1086,16 @@ async function handleTrackingHit(req, res, linkId) {
 
         // 6. Log to Database
         await linkStore.logClick({
-            linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl
+            linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+            botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
         });
 
         // 7. WebSocket Broadcast
         if (link.ownerId) {
             broadcastToUser(link.ownerId, 'LIVE_CLICK', {
-                linkId, isBot, clickType: isBot ? 'bot' : 'human', country, timestamp: Date.now(), ipAddress: ip, score: botResult.score
+                linkId, isBot, clickType: isBot ? 'bot' : 'human', country, timestamp: Date.now(), ipAddress: ip,
+                score: botResult.score, confidence: botResult.confidence, signals: botResult.signals,
+                userAgent: uaString
             });
         }
 
@@ -1017,7 +1190,7 @@ app.post('/tr/v2/unlock', unlockLimiter, async (req, res) => {
         // 2. Validate the destination URL is not our own tracking URL (prevent loops)
         if (destinationUrl.includes('/tr/v1/') || destinationUrl.includes('/tr/v2/') || destinationUrl.includes('/p/')) {
             console.log(chalk.red('[UNLOCK] Loop detected - destination points back to tracking URL'));
-            return res.redirect('https://google.com');
+            return res.redirect(config.redirector.fallbackUrl || 'https://google.com');
         }
 
         // 3. Double-Check Bot Detection (Server Side) - STRICT EDGE BLOCKING
@@ -1679,6 +1852,42 @@ app.get('/api/stats/rate-summary', apiLimiter, authenticateToken, async (req, re
     try {
         const summary = await linkStore.getClickRateSummary(req.user.id);
         res.json(summary);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==================== BOT FEED / HUMAN FEED / THREATS / DOMAIN HEALTH ====================
+// Powering the dashboard "Bot Feed", "Human Conversions", "Top Threats", and
+// "Domain Health" panels. All endpoints require authentication and only return
+// data scoped to the requesting user.
+app.get('/api/analytics/bot-feed', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 100;
+        const feed = await linkStore.getBotFeed(req.user.id, limit);
+        res.json(feed);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/human-feed', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 100;
+        const feed = await linkStore.getHumanFeed(req.user.id, limit);
+        res.json(feed);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/threats/top', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days, 10) || 7;
+        const threats = await linkStore.getTopThreats(req.user.id, days);
+        res.json(threats);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/domain-health', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days, 10) || 1;
+        const health = await linkStore.getDomainHealth(req.user.id, days);
+        res.json(health);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2565,6 +2774,54 @@ app.get('*', (req, res) => {
     }
     res.sendFile(path.join(__dirname, '../public', 'index.html'));
 });
+
+// ==================== STARTUP SELF-CHECK ====================
+// Asserts every critical exported handler used by routes is wired correctly.
+// Fails fast at boot rather than 500ing a real visitor.
+function runStartupSelfCheck() {
+    const required = [
+        ['linkStore', linkStore, ['getLink', 'getLinksForUser', 'logClick', 'getDashboardStats',
+            'getBotFeed', 'getHumanFeed', 'getTopThreats', 'getDomainHealth',
+            'getNextRotationUrl', 'createLinkWithRotations']],
+        ['botDetector', botDetector, null], // module export is the function itself
+        ['cloaker', cloaker, ['encryptPayload', 'decryptPayload', 'verifyChallenge', 'generateChallengePage']],
+        ['safeRedirectChain', safeRedirectChain, ['startChain', 'processHop']],
+        ['shortLinkManager', shortLinkManager, ['resolve', 'recordClick']],
+        ['fraudAnalyzer', fraudAnalyzer, null]
+    ];
+
+    const errors = [];
+    for (const [name, mod, methods] of required) {
+        if (!mod) {
+            errors.push(`Module '${name}' is not loaded.`);
+            continue;
+        }
+        if (methods === null) {
+            if (typeof mod !== 'function') {
+                errors.push(`Module '${name}' is expected to be a function but is ${typeof mod}.`);
+            }
+            continue;
+        }
+        for (const m of methods) {
+            if (typeof mod[m] !== 'function') {
+                errors.push(`Module '${name}' is missing method '${m}' (got ${typeof mod[m]}).`);
+            }
+        }
+    }
+
+    if (errors.length > 0) {
+        console.error(chalk.red('[SELF-CHECK] ✗ Wiring errors detected:'));
+        for (const e of errors) console.error(chalk.red('  - ' + e));
+        // In production: refuse to boot; in dev: warn loudly.
+        if (config.env === 'production') {
+            console.error(chalk.red('[SELF-CHECK] Refusing to start with broken wiring.'));
+            process.exit(1);
+        }
+    } else {
+        console.log(chalk.green('[SELF-CHECK] ✓ All critical handlers wired correctly.'));
+    }
+}
+runStartupSelfCheck();
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {

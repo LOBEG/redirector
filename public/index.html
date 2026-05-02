@@ -412,6 +412,66 @@
                     </div>
                 </div>
 
+                <!-- ==================== BOT DETECTION & THREATS PANELS ==================== -->
+                <div class="insights-grid">
+                    <!-- Bot Feed: latest blocked bots with reason chips -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🤖 Bot Detection Feed</h3>
+                            <button type="button" class="btn-icon-sm" id="refresh-bot-feed-btn" title="Refresh">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"/>
+                                    <polyline points="1 20 1 14 7 14"/>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+                                    <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="card-body scrollable-feed" id="bot-feed-body">
+                            <div class="empty-state-sm">No bot activity yet.</div>
+                        </div>
+                    </div>
+
+                    <!-- Human Conversions: recent verified humans -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>👤 Human Conversions</h3>
+                            <button type="button" class="btn-icon-sm" id="refresh-human-feed-btn" title="Refresh">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"/>
+                                    <polyline points="1 20 1 14 7 14"/>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+                                    <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="card-body scrollable-feed" id="human-feed-body">
+                            <div class="empty-state-sm">No human visits yet.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Top Threats + Domain Health -->
+                <div class="insights-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>⚠️ Top Threats (7d)</h3>
+                        </div>
+                        <div class="card-body" id="top-threats-body">
+                            <div class="empty-state-sm">Loading threat summary...</div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🛡️ Domain Health (24h)</h3>
+                        </div>
+                        <div class="card-body" id="domain-health-body">
+                            <div class="empty-state-sm">Loading domain health...</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Live Feed -->
                 <div class="card live-feed-card">
                     <div class="card-header">

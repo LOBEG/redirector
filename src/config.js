@@ -82,8 +82,19 @@ module.exports = {
       63949,  // Linode / Akamai
       20473,  // Choopa / Vultr
       13335,  // Cloudflare
-      393406  // DigitalOcean
+      393406, // DigitalOcean
+      14618,  // AWS
+      32934,  // Facebook
+      15133,  // Edgecast/Verizon
+      54113,  // Fastly
+      36351   // SoftLayer/IBM
     ]
+  },
+
+  // Bot Detector tuning — overrideable via env vars
+  botDetection: {
+    threshold: parseInt(process.env.BOT_DETECTION_THRESHOLD, 10) || 50,
+    highConfidenceThreshold: parseInt(process.env.BOT_HIGH_CONFIDENCE_THRESHOLD, 10) || 80
   },
 
   // Link configuration

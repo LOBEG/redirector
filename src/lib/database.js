@@ -163,7 +163,7 @@ async function initializeDatabase() {
         `);
         const migMeta = await db.get('SELECT version FROM _migration_meta WHERE id = 1');
         const currentVersion = migMeta ? migMeta.version : 0;
-        const TARGET_VERSION = 7; // Increment when adding new migrations
+        const TARGET_VERSION = 8; // Increment when adding new migrations
 
         if (currentVersion < TARGET_VERSION) {
             console.log(chalk.yellow(`[DATABASE] Checking for necessary schema migrations (v${currentVersion} -> v${TARGET_VERSION})...`));
@@ -290,6 +290,22 @@ async function initializeDatabase() {
                     if (!domainCols.has('railwayDomainId')) {
                         console.log(chalk.cyan('[DATABASE] Migrating: Adding "railwayDomainId" column to custom_domains...'));
                         await db.exec(`ALTER TABLE custom_domains ADD COLUMN railwayDomainId TEXT DEFAULT NULL`);
+                    }
+
+                    // FIX 10 (v8): Bot detection enrichment columns on clicks
+                    // These persist server-side bot detection results so the dashboard
+                    // can show per-click reasons, score, and confidence.
+                    if (!clickCols.has('botScore')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botScore" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botScore INTEGER DEFAULT 0`);
+                    }
+                    if (!clickCols.has('botConfidence')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botConfidence" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botConfidence TEXT DEFAULT NULL`);
+                    }
+                    if (!clickCols.has('botSignals')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botSignals" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botSignals TEXT DEFAULT NULL`);
                     }
 
                     // Update migration version
