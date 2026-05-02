@@ -627,9 +627,9 @@
                                 <div class="form-group">
                                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                                         <input type="checkbox" id="single-use-input" style="width: auto; margin: 0;">
-                                        <span>Single-Use Link</span>
+                                        <span>Bot Single-Hit Mode</span>
                                     </label>
-                                    <div class="helper-text">Link can only be clicked once (prevents scanner replay after real user clicks)</div>
+                                    <div class="helper-text">Block subsequent bot/scanner probes after the first one is detected. Real humans always retain unlimited access.</div>
                                 </div>
                             </div>
                         </div>
@@ -887,12 +887,28 @@
                             <div class="info-icon">ℹ️</div>
                             <div class="info-content">
                                 <strong>DNS Setup:</strong>
-                                Create a <strong>CNAME</strong> record pointing to <code id="cname-target-domains">loading...</code>
+                                Create a <strong>CNAME</strong> record pointing to
+                                <code id="cname-target-domains">loading...</code>
+                                <button type="button" id="copy-cname-target-btn" class="btn-copy" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Copy CNAME target to clipboard">Copy</button>
+                                <button type="button" id="check-all-dns-btn" class="btn-secondary" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Run DNS check for every connected domain">🔄 Check All</button>
                                 <br><small><strong>⚠️ Important:</strong> Do NOT use an A record pointing to a Cloudflare IP (e.g., 104.16.x.x, 172.67.x.x). This causes Cloudflare Error 1000 ("DNS points to prohibited IP"). Always use a CNAME record pointing to your platform hostname (e.g., your-app.up.railway.app), NOT to another custom domain.</small>
                                 <br><small><strong>Link Domain:</strong> Used for generating cloaked links (does not expose dashboard). <strong>Web Domain:</strong> Used to access the engine dashboard.</small>
                                 <br><small><strong>SSL Options:</strong> Use Cloudflare (free) with "Full" or "Full (Strict)" SSL mode, or issue an SSL certificate through your domain registrar.</small>
                                 <br><small><strong>💡 Tip:</strong> If the CNAME target above shows "your-app.up.railway.app", set the <code>CNAME_TARGET</code> environment variable to your Railway hostname (e.g., <code>my-service-production.up.railway.app</code>).</small>
                                 <br><small><strong>🚂 Auto-Registration:</strong> Set <code>RAILWAY_TOKEN</code> env var to automatically register custom domains with Railway when you add them here. Generate a token at Railway dashboard → Account → Tokens.</small>
+                            </div>
+                        </div>
+
+                        <!-- DNS Check Result Panel: shows detailed instructions after a DNS check -->
+                        <div id="dns-check-panel" class="dns-info" hidden style="margin-top:12px;border-left:4px solid #3b82f6;">
+                            <div class="info-icon">🔍</div>
+                            <div class="info-content" style="flex:1;">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                                    <strong id="dns-check-title">DNS Check Results</strong>
+                                    <button type="button" id="dns-check-close-btn" class="btn-text" style="padding:0 6px;font-size:1rem;line-height:1;" title="Close">×</button>
+                                </div>
+                                <div id="dns-check-summary" style="font-size:0.85rem;margin-bottom:8px;"></div>
+                                <ul id="dns-check-instructions" style="margin:0;padding-left:20px;font-size:0.8rem;line-height:1.5;"></ul>
                             </div>
                         </div>
                     </div>

@@ -64,6 +64,13 @@ const app = {
             noDomainsMessage: document.getElementById('no-domains'),
             cnameTarget: document.getElementById('cname-target'),
             cnameTargetDomains: document.getElementById('cname-target-domains'),
+            copyCnameTargetBtn: document.getElementById('copy-cname-target-btn'),
+            checkAllDnsBtn: document.getElementById('check-all-dns-btn'),
+            dnsCheckPanel: document.getElementById('dns-check-panel'),
+            dnsCheckTitle: document.getElementById('dns-check-title'),
+            dnsCheckSummary: document.getElementById('dns-check-summary'),
+            dnsCheckInstructions: document.getElementById('dns-check-instructions'),
+            dnsCheckCloseBtn: document.getElementById('dns-check-close-btn'),
             createShortLinkForm: document.getElementById('create-short-link-form'),
             shortLinkUrl: document.getElementById('short-link-url'),
             shortLinkAlias: document.getElementById('short-link-alias'),
@@ -306,6 +313,28 @@ const app = {
                     const purpose = e.target.value;
                     this.changeDomainPurpose(domainId, purpose);
                 }
+            });
+        }
+        // DNS enhancement: Copy CNAME target button
+        if (this.ui.copyCnameTargetBtn) {
+            this.ui.copyCnameTargetBtn.addEventListener('click', () => {
+                const target = (this.ui.cnameTargetDomains && this.ui.cnameTargetDomains.textContent || '').trim();
+                if (target && target !== 'loading...') {
+                    this.copyToClipboard(target);
+                    this.showToast('success', 'Copied!', `CNAME target "${target}" copied to clipboard.`);
+                } else {
+                    this.showToast('warning', 'Not Ready', 'CNAME target is still loading.');
+                }
+            });
+        }
+        // DNS enhancement: Check All Domains button
+        if (this.ui.checkAllDnsBtn) {
+            this.ui.checkAllDnsBtn.addEventListener('click', () => this.checkAllDomainsDns());
+        }
+        // DNS enhancement: Close DNS result panel
+        if (this.ui.dnsCheckCloseBtn) {
+            this.ui.dnsCheckCloseBtn.addEventListener('click', () => {
+                if (this.ui.dnsCheckPanel) this.ui.dnsCheckPanel.hidden = true;
             });
         }
         if (this.ui.shortLinksTbody) {
@@ -711,10 +740,34 @@ const app = {
     },
 
     async addDomain() {
-        const hostname = this.ui.domainInput.value.trim();
+        // DNS enhancement: sanitize input — strip protocol, paths, query strings, and trailing dots.
+        // Users frequently paste "https://sub.example.com/" or "sub.example.com:443" — accept all
+        // forms but normalize to a bare hostname before sending to the server.
+        let raw = (this.ui.domainInput.value || '').trim().toLowerCase();
+        // Remove URL scheme and any leading "//"
+        raw = raw.replace(/^[a-z][a-z0-9+\-.]*:\/\//, '').replace(/^\/\//, '');
+        // Drop everything from the first slash, question mark, or hash onward
+        raw = raw.split(/[/?#]/, 1)[0];
+        // Strip credentials (user:pass@) if present
+        const atIndex = raw.lastIndexOf('@');
+        if (atIndex !== -1) raw = raw.slice(atIndex + 1);
+        // Strip port (last colon, but only if followed by digits — avoids breaking IPv6 which is unsupported here anyway)
+        raw = raw.replace(/:\d+$/, '');
+        // Strip trailing dot (FQDN root)
+        raw = raw.replace(/\.+$/, '');
+        const hostname = raw;
         const purpose = this.ui.domainPurposeSelect ? this.ui.domainPurposeSelect.value : 'link';
         this.ui.domainError.textContent = '';
         if (!hostname) return;
+        // Hostname format validation — must be a fully-qualified domain (at least two labels).
+        // Mirrors the server-side regex in POST /api/domains; single-label hostnames like
+        // "localhost" are intentionally rejected because Railway / Cloudflare custom domains
+        // always require an FQDN.
+        const hostnameRegex = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+        if (!hostnameRegex.test(hostname)) {
+            this.ui.domainError.textContent = 'Please enter a valid domain (e.g., links.example.com).';
+            return;
+        }
         try {
             const newDomain = await this.handleApiCall('/api/domains', {
                 method: 'POST',
@@ -798,20 +851,22 @@ const app = {
                 domain.sslStatus = result.sslStatus || 'pending';
             }
             this.renderDomains();
+            // Render detailed instructions in the inline panel (always show after check)
+            this.showDnsCheckResult(result);
             if (result.cloudflareConflict) {
-                this.showToast('error', 'Cloudflare Error 1000', `${result.hostname}: DNS resolves to a Cloudflare IP with an A record pointing to a prohibited IP. Remove the A record and create a CNAME instead.`);
+                this.showToast('error', 'Cloudflare Error 1000', `${result.hostname}: DNS resolves to a Cloudflare IP with an A record pointing to a prohibited IP. See instructions panel below.`);
             } else if (result.railwayAutoRegistered) {
                 this.showToast('success', 'Auto-Registered with Railway', `${result.hostname}: Domain was automatically registered with Railway! Wait 1-2 minutes for Railway to provision routing, then check DNS again.`);
             } else if (result.railwayNotRegistered) {
                 if (result.railwayApiConfigured) {
-                    this.showToast('error', 'Railway Registration Failed', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. Auto-registration failed — click "Register with Railway" button or add it manually in Railway settings.`);
+                    this.showToast('error', 'Railway Registration Failed', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. See instructions panel below.`);
                 } else {
-                    this.showToast('error', 'Domain Not Registered with Railway', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. Set RAILWAY_TOKEN env var for automatic registration, or add it manually in Railway's Custom Domain settings.`);
+                    this.showToast('error', 'Domain Not Registered with Railway', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. See instructions panel below.`);
                 }
             } else if (result.cfPending) {
                 this.showToast('warning', 'Cloudflare Propagating', `${result.hostname}: DNS resolves to Cloudflare IPs but HTTPS is not yet reachable. If you just set up the CNAME, wait 2-5 minutes and check again.`);
             } else if (result.sslStatus === 'cert_mismatch') {
-                this.showToast('error', 'SSL Certificate Mismatch', `${result.hostname}: HTTPS is reachable but the SSL certificate doesn't match your domain. Enable Cloudflare proxy (orange cloud) and set SSL to "Full" mode. See instructions below.`);
+                this.showToast('error', 'SSL Certificate Mismatch', `${result.hostname}: HTTPS is reachable but the SSL certificate doesn't match your domain. See instructions panel below.`);
             } else if (result.cloudflareProxied && result.sslReady) {
                 this.showToast('success', 'DNS Verified (CF Proxy)', `${result.hostname} is verified and working through Cloudflare proxy with SSL active!`);
             } else if (result.cloudflareProxied) {
@@ -819,13 +874,115 @@ const app = {
             } else if (result.dnsVerified && result.sslReady) {
                 this.showToast('success', 'DNS Verified', `${result.hostname} is fully configured with SSL!`);
             } else if (result.dnsVerified) {
-                this.showToast('success', 'DNS Verified', `${result.hostname} DNS is verified. SSL: ${result.sslStatus}. Check setup instructions below.`);
+                this.showToast('success', 'DNS Verified', `${result.hostname} DNS is verified. SSL: ${result.sslStatus}. See instructions panel below.`);
             } else {
-                this.showToast('warning', 'DNS Not Verified', `Point ${result.hostname} CNAME to your server. See instructions in the DNS info box.`);
+                this.showToast('warning', 'DNS Not Verified', `Point ${result.hostname} CNAME to your server. See instructions panel below.`);
             }
         } catch (err) {
             this.showToast('error', 'DNS Check Failed', err.message);
         }
+    },
+
+    /**
+     * Render DNS check result details in the inline instructions panel.
+     * Uses textContent (safe from XSS) and exposes the rich `instructions`
+     * array returned by GET /api/domains/:id/dns-check.
+     */
+    showDnsCheckResult(result) {
+        if (!this.ui.dnsCheckPanel || !this.ui.dnsCheckInstructions) return;
+        const title = this.ui.dnsCheckTitle;
+        const summary = this.ui.dnsCheckSummary;
+        const list = this.ui.dnsCheckInstructions;
+
+        if (title) title.textContent = `DNS Check Results — ${result.hostname || 'unknown'}`;
+
+        // Build summary using safe DOM manipulation (no innerHTML on user data)
+        if (summary) {
+            summary.textContent = '';
+            const dnsBadge = document.createElement('span');
+            dnsBadge.className = 'badge ' + (result.dnsVerified ? 'badge-success' : 'badge-warning');
+            dnsBadge.textContent = result.dnsVerified ? '✓ DNS Verified' : '⚠️ DNS Not Verified';
+            const sslBadge = document.createElement('span');
+            sslBadge.className = 'badge ' + (result.sslReady ? 'badge-success' : 'badge-warning');
+            sslBadge.textContent = result.sslReady ? '✓ SSL Active' : (result.sslStatus ? `SSL: ${result.sslStatus}` : 'SSL: pending');
+            sslBadge.style.marginLeft = '6px';
+            summary.appendChild(dnsBadge);
+            summary.appendChild(sslBadge);
+
+            if (result.cname && result.cname.length) {
+                const cnameInfo = document.createElement('div');
+                cnameInfo.style.marginTop = '4px';
+                cnameInfo.style.fontSize = '0.8rem';
+                cnameInfo.textContent = `CNAME → ${result.cname.join(', ')}`;
+                summary.appendChild(cnameInfo);
+            }
+            if (result.a && result.a.length) {
+                const aInfo = document.createElement('div');
+                aInfo.style.marginTop = '4px';
+                aInfo.style.fontSize = '0.8rem';
+                aInfo.textContent = `A → ${result.a.join(', ')}`;
+                summary.appendChild(aInfo);
+            }
+        }
+
+        // Render instructions list (textContent prevents any HTML injection)
+        list.textContent = '';
+        const instructions = Array.isArray(result.instructions) ? result.instructions : [];
+        if (instructions.length === 0) {
+            const li = document.createElement('li');
+            li.textContent = result.dnsVerified ? 'Domain is fully configured.' : 'No specific instructions returned.';
+            list.appendChild(li);
+        } else {
+            instructions.forEach(line => {
+                if (!line || typeof line !== 'string') return;
+                const li = document.createElement('li');
+                if (line.trim() === '') {
+                    li.style.listStyle = 'none';
+                    // Use a non-breaking space text node (consistent with the textContent
+                    // XSS-prevention strategy used throughout this method).
+                    li.textContent = '\u00A0';
+                } else {
+                    li.textContent = line;
+                }
+                list.appendChild(li);
+            });
+        }
+        this.ui.dnsCheckPanel.hidden = false;
+        // Scroll the panel into view so users see the new results immediately
+        try { this.ui.dnsCheckPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) { /* noop */ }
+    },
+
+    /**
+     * Run DNS check sequentially for all connected domains.
+     * Sequential execution avoids overwhelming the DNS resolver and gives
+     * clear per-domain feedback in the UI.
+     */
+    async checkAllDomainsDns() {
+        if (!this.domains || this.domains.length === 0) {
+            this.showToast('warning', 'No Domains', 'No connected domains to check.');
+            return;
+        }
+        this.showToast('info', 'Checking All Domains', `Running DNS check for ${this.domains.length} domain(s)...`);
+        let lastResult = null;
+        let successCount = 0;
+        for (const domain of this.domains) {
+            try {
+                const result = await this.handleApiCall(`/api/domains/${domain.id}/dns-check`);
+                domain.dnsVerified = result.dnsVerified ? 1 : 0;
+                domain.sslStatus = result.sslStatus || 'pending';
+                if (result.dnsVerified) successCount += 1;
+                lastResult = result;
+            } catch (err) {
+                console.warn('DNS check failed for', domain.hostname, err);
+            }
+        }
+        this.renderDomains();
+        if (lastResult) this.showDnsCheckResult(lastResult);
+        this.showToast(
+            successCount === this.domains.length ? 'success' : 'info',
+            'DNS Check Complete',
+            `${successCount}/${this.domains.length} domain(s) verified.`
+        );
     },
 
     async registerDomainWithRailway(domainId) {

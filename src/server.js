@@ -1039,12 +1039,9 @@ async function handleTrackingHit(req, res, linkId) {
             }
         }
 
-        // 1d. Check if link is single-use and already used
-        // For single-use links: first click (human or bot) marks it as used
-        if (link.singleUse === 1 && link.usedAt) {
-            console.log(chalk.yellow(`[TRACKING] Single-use link already used: ${linkId} (used at ${link.usedAt})`));
-            return res.status(410).send('This link has already been used');
-        }
+        // NOTE: Single-use enforcement is intentionally moved to AFTER bot detection.
+        // The single-use restriction applies ONLY to bots/crawlers — real humans can
+        // access the link an unlimited number of times. See step 4 below.
 
         // 2. Bot detection + Geo lookup (extracted helper)
         const { isBot, botResult, country } = await detectBotAndGeo(req);
@@ -1060,7 +1057,23 @@ async function handleTrackingHit(req, res, linkId) {
         // 4. Handle Response - Redirect bots into safe unlimited redirect chain
         if (isBot) {
             console.log(chalk.yellow(`[TRACKING] Bot detected (${botResult.score}) - redirecting into safe chain`));
-            
+
+            // 4a. Single-use enforcement (BOT-ONLY): if this link is marked single-use
+            // and a bot has already touched it, return 410 Gone for all subsequent bot
+            // probes. This defeats scanner replay/probing while keeping the link fully
+            // accessible to real humans (humans never reach this branch).
+            if (link.singleUse === 1 && link.usedAt) {
+                console.log(chalk.yellow(`[TRACKING] Single-use link: blocking subsequent bot probe (first bot at ${link.usedAt})`));
+                // Still log the bot probe for analytics
+                try {
+                    await linkStore.logClick({
+                        linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+                        botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
+                    });
+                } catch (e) { /* non-fatal */ }
+                return res.status(410).send('Gone');
+            }
+
             // Log the initial bot hit
             await linkStore.logClick({
                 linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
@@ -1076,6 +1089,21 @@ async function handleTrackingHit(req, res, linkId) {
                 );
             } catch (e) {
                 console.warn(chalk.yellow('[TRACKING] Failed to log bot redirect event:', e.message));
+            }
+
+            // 4b. Mark single-use link as "consumed by a bot" — only for the FIRST bot.
+            // Subsequent bot probes are blocked at 4a above. Humans never trigger this.
+            if (link.singleUse === 1 && !link.usedAt) {
+                try {
+                    const db = await getDb();
+                    await db.run(
+                        'UPDATE links SET usedAt = CURRENT_TIMESTAMP WHERE id = ? AND usedAt IS NULL',
+                        [linkId]
+                    );
+                    console.log(chalk.cyan(`[TRACKING] Single-use link consumed by first bot: ${linkId}`));
+                } catch (e) {
+                    console.warn(chalk.yellow(`[TRACKING] Failed to mark single-use link: ${e.message}`));
+                }
             }
 
             // Start the safe redirect chain — bot enters an infinite loop of safe pages
@@ -1109,20 +1137,10 @@ async function handleTrackingHit(req, res, linkId) {
             botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
         });
 
-        // 6b. Mark single-use link as used (only for human clicks, not bot clicks)
-        // Bots already went to safe chain above, so this only runs for humans
-        if (link.singleUse === 1 && !link.usedAt) {
-            try {
-                const db = await getDb();
-                await db.run(
-                    'UPDATE links SET usedAt = CURRENT_TIMESTAMP WHERE id = ? AND usedAt IS NULL',
-                    [linkId]
-                );
-                console.log(chalk.cyan(`[TRACKING] Marked single-use link as used: ${linkId}`));
-            } catch (e) {
-                console.warn(chalk.yellow(`[TRACKING] Failed to mark single-use link: ${e.message}`));
-            }
-        }
+        // NOTE: Single-use links are NOT marked when a human clicks. Humans always
+        // have unlimited access. The `usedAt` timestamp is only set when the FIRST
+        // bot probe is detected (see step 4b above), which then blocks all subsequent
+        // bot probes while leaving the link fully open for real users.
 
         // 7. WebSocket Broadcast
         if (link.ownerId) {
