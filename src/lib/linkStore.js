@@ -61,7 +61,9 @@ const linkStore = {
 
     async getLinksForUser(ownerId) {
         const db = await getDb();
-        return db.all('SELECT * FROM links WHERE ownerId = ? ORDER BY createdAt DESC', ownerId);
+        // Feature 18: hide soft-deleted links from default list (recycle bin
+        // surfaces them via /api/links/trash). One-line additive WHERE clause.
+        return db.all('SELECT * FROM links WHERE ownerId = ? AND deletedAt IS NULL ORDER BY createdAt DESC', ownerId);
     },
     
     async getRotationsForLink(linkId) {
@@ -132,17 +134,14 @@ const linkStore = {
         const link = await db.get('SELECT id FROM links WHERE id = ? AND ownerId = ?', [id, ownerId]);
         if (!link) throw new Error("Link not found or permission denied.");
 
-        await db.run('BEGIN TRANSACTION');
-        try {
-            await db.run('DELETE FROM link_destinations WHERE linkId = ?', id);
-            await db.run('DELETE FROM clicks WHERE linkId = ?', id);
-            await db.run('DELETE FROM links WHERE id = ?', id);
-            await db.run('COMMIT');
-            return true;
-        } catch (error) {
-            await db.run('ROLLBACK');
-            throw error;
-        }
+        // Feature 18: soft delete — set deletedAt rather than dropping rows.
+        // The recycle bin endpoint can restore within the retention window.
+        // Hard-delete remains available via DELETE FROM links once trash is purged.
+        const result = await db.run(
+            'UPDATE links SET deletedAt = CURRENT_TIMESTAMP WHERE id = ? AND ownerId = ? AND deletedAt IS NULL',
+            [id, ownerId]
+        );
+        return result.changes > 0;
     },
     
     async logClick({ linkId, isBot, ipAddress, userAgent, country, referrer, destinationUrl, botScore, botConfidence, botSignals }) {
@@ -536,7 +535,8 @@ const linkStore = {
         const searchTerm = `%${query}%`;
         return db.all(`
             SELECT * FROM links 
-            WHERE ownerId = ? 
+            WHERE ownerId = ?
+            AND deletedAt IS NULL
             AND (
                 destinationUrlDesktop LIKE ? 
                 OR tags LIKE ? 
@@ -555,27 +555,12 @@ const linkStore = {
         if (!linkIds || linkIds.length === 0) return 0;
 
         const placeholders = linkIds.map(() => '?').join(',');
-        
-        await db.run('BEGIN');
-        try {
-            await db.run(
-                `DELETE FROM link_destinations WHERE linkId IN (${placeholders})`,
-                linkIds
-            );
-            await db.run(
-                `DELETE FROM clicks WHERE linkId IN (${placeholders})`,
-                linkIds
-            );
-            const result = await db.run(
-                `DELETE FROM links WHERE id IN (${placeholders}) AND ownerId = ?`,
-                [...linkIds, ownerId]
-            );
-            await db.run('COMMIT');
-            return result.changes;
-        } catch (error) {
-            await db.run('ROLLBACK');
-            throw error;
-        }
+        // Feature 18: bulk soft-delete (was hard-delete) so deletes can be undone.
+        const result = await db.run(
+            `UPDATE links SET deletedAt = CURRENT_TIMESTAMP WHERE id IN (${placeholders}) AND ownerId = ? AND deletedAt IS NULL`,
+            [...linkIds, ownerId]
+        );
+        return result.changes;
     },
 
     /**

@@ -349,6 +349,7 @@ const app = {
                 if (button.classList.contains('copy-btn')) this.copyToClipboard(url);
                 else if (button.classList.contains('delete-btn')) this.deleteShortLink(slug);
                 else if (button.classList.contains('analytics-btn')) this.showShortLinkAnalytics(slug);
+                else if (button.classList.contains('qr-btn')) window.open(`/api/short-links/${encodeURIComponent(slug)}/qr.svg`, '_blank');
             });
         }
         if (this.ui.templatesTbody) {
@@ -1125,6 +1126,9 @@ const app = {
                     <div class="action-buttons">
                         <button class="action-btn copy-btn" data-url="${shortUrl}" title="Copy">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        </button>
+                        <button class="action-btn qr-btn" data-slug="${link.slug}" title="QR Code">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="3" height="3"></rect><rect x="18" y="18" width="3" height="3"></rect></svg>
                         </button>
                         <button class="action-btn analytics-btn" data-slug="${link.slug}" title="Analytics">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
@@ -2310,4 +2314,248 @@ const app = {
 
 document.addEventListener('DOMContentLoaded', () => {
     app.init();
+    if (typeof initMoreTools === 'function') initMoreTools(app);
 });
+
+// ============================================================================
+// MORE TOOLS UI MODULE — wires up Features 4, 6, 8, 11, 12, 18, 19, 20.
+//
+// Self-contained: depends only on `app.handleApiCall(...)` (auth-aware fetch),
+// `app.showToast(...)` and the DOM elements created in `index.html` under
+// `#more-tools-section`. Safe to call multiple times — handlers are added
+// once and tables re-render on demand.
+// ============================================================================
+function initMoreTools(app) {
+    const $ = (id) => document.getElementById(id);
+
+    // --- Feature 8: CSV Bulk Import ---
+    // Tiny RFC 4180-aware parser (handles quoted fields with commas + escaped quotes).
+    function parseCsv(text) {
+        const rows = [];
+        let row = [], field = '', inQuotes = false;
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (inQuotes) {
+                if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+                else if (c === '"') inQuotes = false;
+                else field += c;
+            } else {
+                if (c === '"') inQuotes = true;
+                else if (c === ',') { row.push(field); field = ''; }
+                else if (c === '\r') { /* skip */ }
+                else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+                else field += c;
+            }
+        }
+        if (field || row.length) { row.push(field); rows.push(row); }
+        return rows.filter(r => r.length > 1 || (r[0] && r[0].trim()));
+    }
+    if ($('csv-import-btn')) {
+        $('csv-import-btn').addEventListener('click', async () => {
+            const file = $('csv-import-file').files[0];
+            const out = $('csv-import-result');
+            if (!file) { out.textContent = 'Please choose a CSV file first.'; return; }
+            try {
+                const text = await file.text();
+                const rows = parseCsv(text);
+                if (rows.length < 2) throw new Error('CSV must have a header row and at least one data row.');
+                const header = rows[0].map(h => h.trim());
+                const idx = (name) => header.indexOf(name);
+                const destIdx = idx('destinationUrl');
+                if (destIdx < 0) throw new Error('Missing required column: destinationUrl');
+                const links = rows.slice(1).filter(r => r[destIdx]).map(r => {
+                    const obj = { destinationUrl: r[destIdx].trim() };
+                    if (idx('tags') >= 0)       obj.tags = r[idx('tags')];
+                    if (idx('notes') >= 0)      obj.notes = r[idx('notes')];
+                    if (idx('expiresAt') >= 0 && r[idx('expiresAt')]) obj.expiresAt = r[idx('expiresAt')];
+                    if (idx('maxClicks') >= 0 && r[idx('maxClicks')]) obj.maxClicks = parseInt(r[idx('maxClicks')], 10);
+                    return obj;
+                });
+                if (links.length === 0) throw new Error('No valid data rows found.');
+                out.textContent = `Posting ${links.length} link(s)…`;
+                const result = await app.handleApiCall('/api/links/batch', {
+                    method: 'POST', body: JSON.stringify({ links })
+                });
+                out.textContent = 'Imported: ' + JSON.stringify(result, null, 2);
+                app.showToast && app.showToast('success', 'CSV Import', `${links.length} link(s) submitted.`);
+            } catch (e) {
+                out.textContent = 'Error: ' + e.message;
+                app.showToast && app.showToast('error', 'CSV Import', e.message);
+            }
+        });
+    }
+
+    // --- Feature 11: API Keys ---
+    async function loadApiKeys() {
+        if (!$('api-keys-tbody')) return;
+        try {
+            const list = await app.handleApiCall('/api/api-keys');
+            $('api-keys-tbody').innerHTML = list.map(k => `
+                <tr>
+                  <td>${escapeHtml(k.name)}</td>
+                  <td><code>${escapeHtml(k.keyPrefix)}…</code></td>
+                  <td>${k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : '—'}</td>
+                  <td>${new Date(k.createdAt).toLocaleDateString()}</td>
+                  <td>${k.revokedAt
+                    ? '<span style="color:#999">revoked</span>'
+                    : `<button class="btn btn-sm" data-revoke="${k.id}">Revoke</button>`}</td>
+                </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#999">No API keys yet.</td></tr>';
+            $('api-keys-tbody').querySelectorAll('[data-revoke]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    if (!confirm('Revoke this API key? This cannot be undone.')) return;
+                    await app.handleApiCall(`/api/api-keys/${btn.dataset.revoke}`, { method: 'DELETE' });
+                    loadApiKeys();
+                });
+            });
+        } catch (e) { /* ignore until logged in */ }
+    }
+    if ($('api-key-create-btn')) {
+        $('api-key-create-btn').addEventListener('click', async () => {
+            const name = $('api-key-name').value.trim();
+            if (!name) { app.showToast && app.showToast('error', 'API Key', 'Please enter a name.'); return; }
+            try {
+                const result = await app.handleApiCall('/api/api-keys', { method: 'POST', body: JSON.stringify({ name }) });
+                const box = $('api-key-new');
+                box.style.display = 'block';
+                box.innerHTML = `<strong>Save this token now — it will not be shown again:</strong>
+                    <pre style="margin:.5rem 0;user-select:all;background:#fff;padding:.5rem;border-radius:4px;word-break:break-all">${escapeHtml(result.key)}</pre>`;
+                $('api-key-name').value = '';
+                loadApiKeys();
+            } catch (e) { app.showToast && app.showToast('error', 'API Key', e.message); }
+        });
+    }
+
+    // --- Feature 6: account-level webhook ---
+    if ($('account-webhook-save-btn')) {
+        $('account-webhook-save-btn').addEventListener('click', async () => {
+            const url = $('account-webhook-url').value.trim();
+            try {
+                await app.handleApiCall('/api/me/webhook', {
+                    method: 'PATCH', body: JSON.stringify({ webhookUrl: url || null })
+                });
+                app.showToast && app.showToast('success', 'Webhook', url ? 'Saved.' : 'Cleared.');
+            } catch (e) { app.showToast && app.showToast('error', 'Webhook', e.message); }
+        });
+    }
+
+    // --- Feature 12: heatmap + funnel ---
+    async function loadHeatmap() {
+        if (!$('heatmap-container')) return;
+        try {
+            const data = await app.handleApiCall('/api/stats/click-heatmap?days=30');
+            // Find max for color scaling
+            let max = 0;
+            for (const row of data.matrix) for (const v of row) if (v > max) max = v;
+            const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+            let html = '<table style="border-collapse:collapse;font-size:.7rem"><tr><th></th>';
+            for (let h = 0; h < 24; h++) html += `<th style="padding:2px 4px">${h}</th>`;
+            html += '</tr>';
+            for (let d = 0; d < 7; d++) {
+                html += `<tr><td style="padding:2px 6px;font-weight:600">${days[d]}</td>`;
+                for (let h = 0; h < 24; h++) {
+                    const v = data.matrix[d][h] || 0;
+                    const intensity = max > 0 ? Math.round((v / max) * 100) : 0;
+                    const bg = intensity > 0 ? `rgba(79,70,229,${0.15 + intensity * 0.0085})` : '#f3f4f6';
+                    html += `<td title="${days[d]} ${h}:00 — ${v} clicks" style="width:18px;height:18px;background:${bg};border:1px solid #fff"></td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</table>';
+            $('heatmap-container').innerHTML = html;
+        } catch (e) { /* ignore */ }
+    }
+    async function loadFunnel() {
+        if (!$('funnel-container')) return;
+        try {
+            const f = await app.handleApiCall('/api/stats/conversion-funnel?days=7');
+            $('funnel-container').innerHTML = `
+                <ul style="list-style:none;padding:0;margin:0">
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Impressions: <strong>${f.impressions}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Unlock attempts (humans): <strong>${f.unlockAttempts}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Successful unlocks: <strong>${f.successfulUnlocks}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Bot blocks: <strong>${f.botBlocks}</strong></li>
+                    <li style="padding:.4rem 0">Bot redirect hops served: <strong>${f.botRedirectHops}</strong></li>
+                </ul>`;
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- Feature 18: Recycle Bin ---
+    async function loadTrash() {
+        if (!$('trash-tbody')) return;
+        try {
+            const list = await app.handleApiCall('/api/links/trash');
+            $('trash-tbody').innerHTML = list.map(l => `
+                <tr>
+                    <td><code>${escapeHtml(l.id)}</code></td>
+                    <td><span title="${escapeHtml(l.destinationUrlDesktop || '')}">${escapeHtml((l.destinationUrlDesktop || '').slice(0, 50))}</span></td>
+                    <td>${l.deletedAt ? new Date(l.deletedAt).toLocaleString() : ''}</td>
+                    <td><button class="btn btn-sm" data-restore="${escapeHtml(l.id)}">Restore</button></td>
+                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:#999">Trash is empty.</td></tr>';
+            $('trash-tbody').querySelectorAll('[data-restore]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    await app.handleApiCall(`/api/links/${encodeURIComponent(btn.dataset.restore)}/restore`, { method: 'POST' });
+                    loadTrash();
+                    app.showToast && app.showToast('success', 'Restore', 'Link restored.');
+                });
+            });
+        } catch (e) { /* ignore */ }
+    }
+    if ($('trash-refresh-btn')) $('trash-refresh-btn').addEventListener('click', loadTrash);
+
+    // --- Feature 19: Cloaker presets display ---
+    async function loadPresets() {
+        if (!$('cloaker-presets-display')) return;
+        try {
+            const p = await app.handleApiCall('/api/cloaker-presets');
+            $('cloaker-presets-display').textContent = JSON.stringify(p, null, 2);
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- Feature 20: Export / Import ---
+    if ($('account-export-btn')) {
+        $('account-export-btn').addEventListener('click', async () => {
+            try {
+                // Use raw fetch so we can stream the file download
+                const r = await fetch('/api/account/export', { headers: app.token ? { 'Authorization': 'Bearer ' + app.token } : {} });
+                if (!r.ok) throw new Error('Export failed: ' + r.status);
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `account-export-${Date.now()}.json`;
+                document.body.appendChild(a); a.click(); a.remove();
+                URL.revokeObjectURL(url);
+            } catch (e) { app.showToast && app.showToast('error', 'Export', e.message); }
+        });
+    }
+    if ($('account-import-btn')) {
+        $('account-import-btn').addEventListener('click', async () => {
+            const file = $('account-import-file').files[0];
+            const out = $('account-import-result');
+            if (!file) { out.textContent = 'Choose an export JSON file.'; return; }
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                const result = await app.handleApiCall('/api/account/import', {
+                    method: 'POST', body: JSON.stringify(data)
+                });
+                out.textContent = 'Imported: ' + JSON.stringify(result.imported || result, null, 2);
+                app.showToast && app.showToast('success', 'Import', 'Account data imported.');
+            } catch (e) { out.textContent = 'Error: ' + e.message; }
+        });
+    }
+
+    // Activate when section becomes visible
+    function refreshAll() {
+        loadApiKeys(); loadHeatmap(); loadFunnel(); loadTrash(); loadPresets();
+    }
+    // Best-effort: auto-load when user clicks the "More Tools" nav link
+    document.querySelectorAll('a[href="#more-tools-section"]').forEach(a => {
+        a.addEventListener('click', () => setTimeout(refreshAll, 100));
+    });
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+}

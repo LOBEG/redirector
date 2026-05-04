@@ -28,7 +28,13 @@ const SUPPORTED_TOKENS = {
     // duration in their own JS, or in a CSS animation-duration). It is also
     // emitted as a <meta name="x-redirect-delay"> tag by the unlock injector
     // so the server-controlled redirect script honors the same value.
-    '%%REDIRECT_DELAY%%': 'redirectDelay'
+    '%%REDIRECT_DELAY%%': 'redirectDelay',
+    // Feature 17 — visitor-context tokens. All values are HTML-escaped before
+    // substitution so a malicious User-Agent / Referer can't inject markup.
+    // The IP is replaced with a one-way SHA-256-HMAC hash for GDPR safety.
+    '%%USER_AGENT%%': 'userAgent',
+    '%%IP_HASH%%': 'ipHash',
+    '%%REFERRER%%': 'referrer'
 };
 
 // Default + clamps for the %%REDIRECT_DELAY%% token. Kept here (rather than
@@ -273,8 +279,19 @@ function processTemplate(rawInput, options = {}) {
         linkId = 'preview',
         country = 'Unknown',
         domain = 'localhost',
-        redirectDelay
+        redirectDelay,
+        // Feature 17 inputs — caller is responsible for hashing the IP. We
+        // ONLY HTML-escape the strings (no further sanitization) since the
+        // template body has its own NUCLEAR_FREEZER + script sanitizer pass.
+        userAgent = '',
+        ipHash = '',
+        referrer = ''
     } = options;
+
+    // Tiny HTML escaper for visitor-context tokens (must not propagate markup).
+    const _escTok = (s) => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
     // Sanitize/clamp redirectDelay to a safe integer range. Falls back to the
     // module default when undefined or invalid.
@@ -366,7 +383,10 @@ function processTemplate(rawInput, options = {}) {
         domain,
         rayId: uuidv4().replace(/-/g, '').substring(0, 16),
         timestamp: Date.now().toString(),
-        redirectDelay: String(safeRedirectDelay)
+        redirectDelay: String(safeRedirectDelay),
+        userAgent: _escTok(userAgent),
+        ipHash: _escTok(ipHash),
+        referrer: _escTok(referrer)
     };
     for (const [token, key] of Object.entries(SUPPORTED_TOKENS)) {
         const regex = new RegExp(token, 'g');

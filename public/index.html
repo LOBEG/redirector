@@ -205,6 +205,15 @@
                                 <span>Custom Domains</span>
                             </a>
                         </li>
+                        <li>
+                            <a href="#more-tools-section" class="nav-link">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="3"/>
+                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                                </svg>
+                                <span>More Tools</span>
+                            </a>
+                        </li>
                         <li id="admin-nav-item" style="display:none;">
                             <a href="#admin-section" class="nav-link">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -936,6 +945,105 @@
                             <p>No custom domains connected.</p>
                         </div>
                     </div>
+                </div>
+            </section>
+
+            <!-- ==================== MORE TOOLS SECTION (Features 4, 8, 11, 12, 14, 18, 19, 20) ==================== -->
+            <section id="more-tools-section" class="content-section" hidden>
+                <div class="section-header">
+                    <div class="header-title">
+                        <h1>More Tools</h1>
+                        <p>Bulk import, API keys, recycle bin, account export and more</p>
+                    </div>
+                </div>
+
+                <!-- CSV Bulk Import (Feature 8) -->
+                <div class="card">
+                    <h2>Bulk Import Links from CSV</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        CSV must include a <code>destinationUrl</code> column. Optional columns:
+                        <code>tags</code>, <code>notes</code>, <code>expiresAt</code>, <code>maxClicks</code>.
+                        File is parsed in your browser and posted to <code>/api/links/batch</code>.
+                    </p>
+                    <input type="file" id="csv-import-file" accept=".csv,text/csv">
+                    <button id="csv-import-btn" class="btn btn-primary" style="margin-left:.5rem">Import</button>
+                    <pre id="csv-import-result" style="margin-top:.75rem;white-space:pre-wrap;color:#374151;font-size:.85rem"></pre>
+                </div>
+
+                <!-- API Keys (Feature 11) -->
+                <div class="card">
+                    <h2>API Keys / Personal Access Tokens</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Use these tokens with <code>Authorization: Bearer rdr_…</code> to automate link creation
+                        without storing your password. The token is shown once on creation.
+                    </p>
+                    <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem">
+                        <input type="text" id="api-key-name" placeholder="Key name (e.g., zapier-prod)" style="flex:1;padding:.5rem;border:1px solid #d1d5db;border-radius:6px">
+                        <button id="api-key-create-btn" class="btn btn-primary">Create Key</button>
+                    </div>
+                    <div id="api-key-new" style="display:none;padding:.75rem;background:#fef3c7;border-radius:6px;margin-bottom:.75rem"></div>
+                    <table style="width:100%;border-collapse:collapse">
+                        <thead><tr><th style="text-align:left">Name</th><th>Prefix</th><th>Last Used</th><th>Created</th><th></th></tr></thead>
+                        <tbody id="api-keys-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Account Webhook (Feature 6 — account-level fallback) -->
+                <div class="card">
+                    <h2>Account-level Click Webhook</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Receive a signed POST after every click. The HMAC signature uses your JWT secret
+                        and is sent in the <code>X-Webhook-Signature</code> header. Per-link webhooks override this.
+                    </p>
+                    <div style="display:flex;gap:.5rem;align-items:center">
+                        <input type="url" id="account-webhook-url" placeholder="https://hooks.slack.com/..." style="flex:1;padding:.5rem;border:1px solid #d1d5db;border-radius:6px">
+                        <button id="account-webhook-save-btn" class="btn btn-primary">Save</button>
+                    </div>
+                </div>
+
+                <!-- Click Heatmap + Conversion Funnel (Feature 12) -->
+                <div class="card">
+                    <h2>Click Heatmap (last 30 days)</h2>
+                    <p style="color:#6b7280;font-size:.9rem">Day-of-week × hour-of-day human-click distribution.</p>
+                    <div id="heatmap-container" style="margin-top:.5rem"></div>
+                    <h2 style="margin-top:1.5rem">Conversion Funnel (last 7 days)</h2>
+                    <div id="funnel-container" style="margin-top:.5rem"></div>
+                </div>
+
+                <!-- Recycle Bin (Feature 18) -->
+                <div class="card">
+                    <h2>Recycle Bin</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Deleted links are kept here. Click "Restore" to undelete.
+                    </p>
+                    <button id="trash-refresh-btn" class="btn">Refresh</button>
+                    <table style="width:100%;border-collapse:collapse;margin-top:.75rem">
+                        <thead><tr><th style="text-align:left">Link</th><th>Destination</th><th>Deleted</th><th></th></tr></thead>
+                        <tbody id="trash-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Cloaker Presets help (Feature 19) -->
+                <div class="card">
+                    <h2>Cloaker Profiles</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0">
+                        Per-link redirect timing presets. Set on each link via the settings API
+                        (<code>PATCH /api/links/:id/settings</code> with <code>cloakerProfile</code>).
+                    </p>
+                    <pre id="cloaker-presets-display" style="font-size:.8rem;background:#f9fafb;padding:.5rem;border-radius:6px"></pre>
+                </div>
+
+                <!-- Account Export / Import (Feature 20) -->
+                <div class="card">
+                    <h2>Account Export / Import</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Download all your templates, short links and custom domains as JSON. Re-import
+                        into another account. Live tracking links are not included by design.
+                    </p>
+                    <button id="account-export-btn" class="btn">Download Export</button>
+                    <input type="file" id="account-import-file" accept="application/json,.json" style="margin-left:.5rem">
+                    <button id="account-import-btn" class="btn">Import</button>
+                    <pre id="account-import-result" style="margin-top:.5rem;font-size:.85rem;white-space:pre-wrap"></pre>
                 </div>
             </section>
 

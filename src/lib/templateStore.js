@@ -103,6 +103,21 @@ const templateStore = {
             );
 
             if (existing) {
+                // Feature 9: snapshot the prior version before overwriting.
+                // Best-effort — failure to write a revision must not block save.
+                try {
+                    const prior = await db.get(
+                        `SELECT htmlContent, description FROM ${TABLE} WHERE id = ?`,
+                        [existing.id]
+                    );
+                    if (prior && prior.htmlContent) {
+                        await db.run(
+                            'INSERT INTO link_template_revisions (templateId, ownerId, htmlContent, description) VALUES (?, ?, ?, ?)',
+                            [existing.id, ownerId, prior.htmlContent, prior.description || null]
+                        );
+                    }
+                } catch (e) { /* non-fatal — table may not exist on first run */ }
+
                 await db.run(
                     `UPDATE ${TABLE} 
                      SET htmlContent = ?, description = ?, isDefault = ?, updatedAt = CURRENT_TIMESTAMP 

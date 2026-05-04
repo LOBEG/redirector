@@ -163,7 +163,7 @@ async function initializeDatabase() {
         `);
         const migMeta = await db.get('SELECT version FROM _migration_meta WHERE id = 1');
         const currentVersion = migMeta ? migMeta.version : 0;
-        const TARGET_VERSION = 9; // Increment when adding new migrations
+        const TARGET_VERSION = 10; // Increment when adding new migrations
 
         if (currentVersion < TARGET_VERSION) {
             console.log(chalk.yellow(`[DATABASE] Checking for necessary schema migrations (v${currentVersion} -> v${TARGET_VERSION})...`));
@@ -320,6 +320,132 @@ async function initializeDatabase() {
                         console.log(chalk.cyan('[DATABASE] Migrating: Adding "usedAt" column to links...'));
                         await db.exec(`ALTER TABLE links ADD COLUMN usedAt TEXT DEFAULT NULL`);
                     }
+
+                    // FIX 12 (v10): Additive feature columns + new feature tables.
+                    // All columns are nullable / default-safe so existing rows behave unchanged.
+                    // ====================== LINKS TABLE ======================
+                    if (!linkCols.has('maxClicks')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "maxClicks" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN maxClicks INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('accessPin')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "accessPin" column to links (hashed PIN)...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN accessPin TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('webhookUrl')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "webhookUrl" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN webhookUrl TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeFromHour')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeFromHour" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeFromHour INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeToHour')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeToHour" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeToHour INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeTimezone')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeTimezone" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeTimezone TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('cloakerProfile')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "cloakerProfile" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN cloakerProfile TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('deletedAt')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "deletedAt" column to links (soft delete)...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN deletedAt DATETIME DEFAULT NULL`);
+                        await db.exec(`CREATE INDEX IF NOT EXISTS idx_links_deletedAt ON links(deletedAt)`);
+                    }
+                    // Per-user account-level webhook URL (used when link.webhookUrl is null)
+                    if (!userCols.has('webhookUrl')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "webhookUrl" column to users...'));
+                        await db.exec(`ALTER TABLE users ADD COLUMN webhookUrl TEXT DEFAULT NULL`);
+                    }
+                    // ====================== LINK_DESTINATIONS — TARGETING RULES ======================
+                    const destCols = new Set((await db.all("PRAGMA table_info(link_destinations)")).map(c => c.name));
+                    if (!destCols.has('rules')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "rules" column to link_destinations...'));
+                        await db.exec(`ALTER TABLE link_destinations ADD COLUMN rules TEXT DEFAULT NULL`);
+                    }
+                    // ====================== LINK_TEMPLATES — PUBLIC FLAG ======================
+                    const tplCols = new Set((await db.all("PRAGMA table_info(link_templates)")).map(c => c.name));
+                    if (!tplCols.has('isPublic')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "isPublic" column to link_templates...'));
+                        await db.exec(`ALTER TABLE link_templates ADD COLUMN isPublic INTEGER DEFAULT 0`);
+                        await db.exec(`CREATE INDEX IF NOT EXISTS idx_templates_public ON link_templates(isPublic)`);
+                    }
+                    // ====================== NEW TABLES ======================
+                    // Template revision history (Feature 9)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS link_template_revisions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            templateId INTEGER NOT NULL,
+                            ownerId INTEGER NOT NULL,
+                            htmlContent TEXT NOT NULL,
+                            description TEXT,
+                            savedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY(templateId) REFERENCES link_templates(id) ON DELETE CASCADE,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_tpl_rev_template ON link_template_revisions(templateId)`);
+                    // API keys / personal access tokens (Feature 11)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS api_keys (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ownerId INTEGER NOT NULL,
+                            name TEXT NOT NULL,
+                            keyHash TEXT UNIQUE NOT NULL,
+                            keyPrefix TEXT NOT NULL,
+                            scopes TEXT DEFAULT 'read,write',
+                            lastUsedAt DATETIME,
+                            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            revokedAt DATETIME,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_owner ON api_keys(ownerId)`);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(keyHash)`);
+                    // Public read-only analytics share tokens (Feature 14)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS analytics_share_tokens (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            token TEXT UNIQUE NOT NULL,
+                            linkId TEXT NOT NULL,
+                            ownerId INTEGER NOT NULL,
+                            expiresAt DATETIME,
+                            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY(linkId) REFERENCES links(id) ON DELETE CASCADE,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_share_token ON analytics_share_tokens(token)`);
+                    // Click anomaly baselines (Feature 16) — rolling per-link mean/stddev
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS link_anomaly_baselines (
+                            linkId TEXT PRIMARY KEY,
+                            meanHourlyClicks REAL DEFAULT 0,
+                            stddevHourlyClicks REAL DEFAULT 0,
+                            sampleCount INTEGER DEFAULT 0,
+                            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            lastAlertAt DATETIME,
+                            FOREIGN KEY(linkId) REFERENCES links(id) ON DELETE CASCADE
+                        )
+                    `);
+                    // Webhook delivery log (Feature 6) — for retry/debug visibility
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS click_webhook_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            linkId TEXT,
+                            ownerId INTEGER,
+                            url TEXT,
+                            status INTEGER,
+                            error TEXT,
+                            attemptedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_log_owner ON click_webhook_log(ownerId)`);
 
                     // Update migration version
                     await db.run(

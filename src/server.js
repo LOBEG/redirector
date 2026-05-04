@@ -30,6 +30,9 @@ const safeRedirectChain = require('./lib/safeRedirectChain');
 const config = require('./config');
 const auth = require('./lib/auth');
 const fraudAnalyzer = require('./lib/fraud');
+const featuresExtra = require('./lib/featuresExtra');
+const apiKeyManager = require('./lib/apiKeyManager');
+const { buildExtraRouter } = require('./lib/extraRoutes');
 
 console.log(chalk.green('[SYSTEM] All local modules loaded successfully. '));
 
@@ -506,7 +509,7 @@ async function ensureDefaultUser() {
 ensureDefaultUser();
 
 // Middleware to verify JWT
-const authenticateToken = (req, res, next) => {
+const authenticateTokenJwt = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.sendStatus(401);
@@ -517,6 +520,11 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+// API-key-aware wrapper: tries `Authorization: Bearer rdr_…` against api_keys
+// first, falls through to JWT verification. Same downstream contract — populates
+// req.user with { id, user, role } so all existing routes work unchanged.
+const authenticateToken = apiKeyManager.makeApiKeyAwareAuth(authenticateTokenJwt);
 
 // Optional auth - attaches user if token present but doesn't require it
 const optionalAuth = (req, res, next) => {
@@ -742,7 +750,7 @@ async function detectBotAndGeo(req) {
  * Generates the client-side unlock script with encrypted payload.
  * This is the JavaScript blob injected into the template page.
  */
-function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
+function buildUnlockScript(linkId, encryptedPayload, challengeToken, profile) {
     const payloadSafe = JSON.stringify(encryptedPayload)
         .replace(/\\/g, '\\\\')
         .replace(/"/g, '\\"')
@@ -762,16 +770,12 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         return '_' + s;
     };
     const noiseId = rnd(10).slice(1);
-    // Random submit jitter — added on top of a baseline delay so scanners can't
-    // pattern-match a fixed timer. Range: 600–1500ms.
-    const submitJitter = 600 + Math.floor(Math.random() * 900);
-    // Baseline auto-submit delay (ms). Bumped to 4000ms (was 1500ms) so that
-    // user-supplied HTML templates with their own animations, loaders and
-    // captcha UIs have visible time on screen before the system redirects.
-    // Templates can override this per-page via:
-    //     <meta name="x-redirect-delay" content="6000">
-    // The opt-in is clamped server-side via the same min/max in the script.
-    const REDIRECT_DELAY_BASELINE_MS = 4000;
+    // Feature 19: cloaker preset profiles (Fast / Balanced / Stealth). When
+    // a link has no profile set, the helper returns the existing "Balanced"
+    // defaults — zero behavior change.
+    const preset = featuresExtra.getCloakerProfile(profile);
+    const submitJitter = preset.jitterMin + Math.floor(Math.random() * Math.max(1, (preset.jitterMax - preset.jitterMin)));
+    const REDIRECT_DELAY_BASELINE_MS = preset.redirectDelayMs;
     const REDIRECT_DELAY_MIN_MS = 1000;
     const REDIRECT_DELAY_MAX_MS = 30000;
 
@@ -997,11 +1001,16 @@ async function buildCloakedPage(req, link, linkId, country, selectedDestinationU
     });
 
     // B. Process template - CRITICAL: injectRedirect = false
+    const ipForHash = req.clientIp || req.ip || '';
     const { html: processedHtml } = processTemplate(rawTemplate, {
         destinationUrl: '#', // Don't expose real URL in template tokens
         linkId: linkId,
         country: country,
         domain: req.get('host'),
+        // Feature 17: visitor-context tokens. Hashed IP keeps it GDPR-safe.
+        userAgent: req.headers['user-agent'] || '',
+        referrer: req.headers['referer'] || req.headers['referrer'] || '',
+        ipHash: featuresExtra.hashIp(ipForHash, JWT_SECRET),
         injectRedirect: false // CRITICAL: Disable processor's redirect to use our secure unlock
     });
 
@@ -1015,8 +1024,8 @@ async function buildCloakedPage(req, link, linkId, country, selectedDestinationU
         { expiresIn: '3m' }
     );
 
-    // E. Build the unlock script
-    const unlockScript = buildUnlockScript(linkId, encrypted, challengeToken);
+    // E. Build the unlock script — applies the link's cloaker preset (Feature 19)
+    const unlockScript = buildUnlockScript(linkId, encrypted, challengeToken, link.cloakerProfile);
 
     // F. Inject the unlock script at the end of body
     let finalHtml = processedHtml;
@@ -1058,8 +1067,22 @@ async function handleTrackingHit(req, res, linkId) {
             const expiryDate = new Date(link.expiresAt);
             if (now > expiryDate) {
                 console.log(chalk.yellow(`[TRACKING] Link expired: ${linkId} (expired at ${link.expiresAt})`));
-                return res.status(410).send('This link has expired');
+                return res.status(404).send(LINK_DOMAIN_404_PAGE);
             }
+        }
+
+        // 1d. Click cap (Feature 1) — humans-only count, returns 404 page when reached.
+        // Bot probes do not consume the cap (they're filtered out via getNextRotationUrl flow).
+        if (featuresExtra.isClickCapReached(link)) {
+            console.log(chalk.yellow(`[TRACKING] Link click cap reached: ${linkId}`));
+            return res.status(404).send(LINK_DOMAIN_404_PAGE);
+        }
+
+        // 1e. Active hours window (Feature 7) — outside window → fallback URL
+        if (!featuresExtra.isWithinActiveHours(link)) {
+            const fallback = (config.redirector && config.redirector.fallbackUrl) || 'https://www.google.com';
+            console.log(chalk.yellow(`[TRACKING] Outside active hours for ${linkId}, redirecting to fallback`));
+            return res.redirect(302, fallback);
         }
 
         // NOTE: Single-use enforcement is intentionally moved to AFTER bot detection.
@@ -1068,10 +1091,30 @@ async function handleTrackingHit(req, res, linkId) {
 
         // 2. Bot detection + Geo lookup (extracted helper)
         const { isBot, botResult, country } = await detectBotAndGeo(req);
-        
-        // 3. Get the ACTUAL destination URL — select from rotations if available
-        const destinationUrl = await linkStore.getNextRotationUrl(linkId, link.destinationUrlDesktop);
-        
+
+        // 3. Get the ACTUAL destination URL — select from rotations if available.
+        // Feature 3: per-destination geo / device / ASN / hours rules. If no
+        // rotation matches the current visitor, falls back to the unfiltered
+        // weighted selection (zero behavior change for existing links).
+        let destinationUrl;
+        try {
+            const rotations = await linkStore.getRotationsForLink(linkId);
+            if (rotations && rotations.length > 0) {
+                const geo = geoip.lookup(ip) || {};
+                const ctx = {
+                    country: country,
+                    device: featuresExtra.classifyDevice(uaString),
+                    asn: geo.org || ''
+                };
+                const picked = featuresExtra.pickRotationWithRules(rotations, ctx);
+                destinationUrl = picked ? picked.url : link.destinationUrlDesktop;
+            } else {
+                destinationUrl = link.destinationUrlDesktop;
+            }
+        } catch (e) {
+            destinationUrl = await linkStore.getNextRotationUrl(linkId, link.destinationUrlDesktop);
+        }
+
         if (!destinationUrl) {
             console.log(chalk.red(`[TRACKING] No destination URL for link:  ${linkId}`));
             return res.status(404).send('Link destination not configured');
@@ -1154,11 +1197,52 @@ async function handleTrackingHit(req, res, linkId) {
             }
         }
 
+        // 5b. PIN gate (Feature 2). Real-human-only — bots already exited above.
+        // The PIN cookie is a JWT signed with JWT_SECRET so it can't be forged.
+        // Keeping the gate AFTER bot detection means scanners never see the prompt.
+        if (link.accessPin) {
+            const pinCookieName = `tr_pin_${linkId}`;
+            const pinToken = cookies[pinCookieName];
+            let pinOk = false;
+            if (pinToken) {
+                try {
+                    const decoded = jwt.verify(pinToken, JWT_SECRET);
+                    pinOk = decoded && decoded.lid === linkId && decoded.t === 'pin';
+                } catch (e) { pinOk = false; }
+            }
+            if (!pinOk) {
+                console.log(chalk.cyan(`[TRACKING] PIN required for link ${linkId} — serving gate`));
+                res.setHeader('Content-Type', 'text/html; charset=utf-8');
+                res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+                return res.status(200).send(featuresExtra.renderPinGatePage(linkId));
+            }
+        }
+
         // 6. Log to Database
         await linkStore.logClick({
             linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
             botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
         });
+
+        // 6b. Webhook on click (Feature 6). Fire-and-forget; never blocks redirect.
+        try {
+            const db = await getDb();
+            const owner = await db.get('SELECT webhookUrl FROM users WHERE id = ?', [link.ownerId]);
+            const webhookUrl = link.webhookUrl || (owner && owner.webhookUrl);
+            if (webhookUrl) {
+                featuresExtra.fireClickWebhook({
+                    url: webhookUrl,
+                    secret: JWT_SECRET,
+                    payload: {
+                        type: 'click',
+                        linkId, isBot, country, timestamp: Date.now(),
+                        userAgent: uaString,
+                        botScore: botResult.score
+                    },
+                    linkId, ownerId: link.ownerId
+                });
+            }
+        } catch (e) { /* non-fatal */ }
 
         // NOTE: Single-use links are NOT marked when a human clicks. Humans always
         // have unlimited access. The `usedAt` timestamp is only set when the FIRST
@@ -1194,6 +1278,47 @@ async function handleTrackingHit(req, res, linkId) {
 
 // ==================== UNLOCK ROUTE (POST) - HARDENED ====================
 const unlockLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+
+// ==================== PIN GATE ENDPOINT (Feature 2) ====================
+// Validates the user-supplied PIN against the link's bcrypt hash and, on
+// success, sets a short-lived signed cookie (tr_pin_<linkId>) that the main
+// tracking handler checks on the next request. Reuses unlockLimiter for
+// rate-limiting (consistent with other unlock endpoints).
+const PIN_COOKIE_TTL_SECONDS = 600; // 10 minutes
+app.post('/tr/v2/pin', unlockLimiter, express.json(), async (req, res) => {
+    try {
+        const { lid, pin } = req.body || {};
+        if (!lid || !pin) {
+            return res.status(400).json({ error: 'Missing PIN or link id.' });
+        }
+        const link = await linkStore.getLink(lid);
+        if (!link || !link.accessPin) {
+            return res.status(404).json({ error: 'Link not found or no PIN required.' });
+        }
+        // Reject expired / capped / out-of-hours links here too — defense in depth
+        if (link.expiresAt && new Date() > new Date(link.expiresAt)) {
+            return res.status(410).json({ error: 'This link has expired.' });
+        }
+        if (featuresExtra.isClickCapReached(link)) {
+            return res.status(410).json({ error: 'This link has reached its limit.' });
+        }
+        const ok = await featuresExtra.verifyAccessPin(pin, link.accessPin);
+        if (!ok) {
+            return res.status(401).json({ error: 'Incorrect access code.' });
+        }
+        const token = jwt.sign({ lid, t: 'pin', ts: Date.now() }, JWT_SECRET, { expiresIn: `${PIN_COOKIE_TTL_SECONDS}s` });
+        const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+        const cookie = `tr_pin_${encodeURIComponent(lid)}=${token}; Max-Age=${PIN_COOKIE_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Lax${isHttps ? '; Secure' : ''}`;
+        res.setHeader('Set-Cookie', cookie);
+        // The browser then re-fetches the original tracking URL, which now
+        // sees the cookie and proceeds into the cloaker flow.
+        return res.json({ success: true, next: `/tr/v1/${encodeURIComponent(lid)}` });
+    } catch (e) {
+        console.error(chalk.red('[PIN]'), e.message);
+        return res.status(500).json({ error: 'Internal error.' });
+    }
+});
+
 app.post('/tr/v2/unlock', unlockLimiter, async (req, res) => {
     try {
         const payloadString = req.body.payload;
@@ -1477,6 +1602,10 @@ app.get('/s/:slug', async (req, res) => {
             linkId: shortLinkId,
             country: country,
             domain: req.get('host'),
+            // Feature 17 tokens
+            userAgent: req.headers['user-agent'] || '',
+            referrer: req.headers['referer'] || req.headers['referrer'] || '',
+            ipHash: featuresExtra.hashIp(ip, JWT_SECRET),
             injectRedirect: false // CRITICAL: Use our secure unlock flow instead
         });
 
@@ -1512,6 +1641,30 @@ app.get('/s/:slug', async (req, res) => {
 // ==================== API ROUTES ====================
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
 const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+
+// ==================== EXTRA FEATURE ROUTES ====================
+// Mounted BEFORE the existing /api/* routes so that the new public endpoints
+// (/api/templates/public, /api/templates/tokens-extended, etc.) win the
+// route-match against shadowing wildcards like /api/templates/:name.
+// Routes registered here:
+//   GET  /api/short-links/:slug/qr.svg          (Feature 4)
+//   GET  /api/links/:id/qr.svg                  (Feature 4)
+//   GET/POST template revisions + restore       (Feature 9)
+//   CRUD for /api/api-keys                      (Feature 11)
+//   GET  /api/stats/click-heatmap               (Feature 12)
+//   GET  /api/stats/conversion-funnel           (Feature 12)
+//   POST /api/links/:id/share + GET /pub/stats  (Feature 14)
+//   GET  /api/templates/public + clone/visibility (Feature 15)
+//   GET  /api/templates/tokens-extended         (Feature 17)
+//   GET  /api/links/trash + POST restore        (Feature 18)
+//   GET  /api/cloaker-presets                   (Feature 19)
+//   GET  /api/account/export, POST /import      (Feature 20)
+app.use(buildExtraRouter({
+    authenticateToken,
+    apiLimiter,
+    getUserPreferredDomain,
+    getJwtSecret: () => JWT_SECRET
+}));
 
 // --- Initial Setup Endpoints (for first-time admin key retrieval) ---
 app.get('/api/setup/status', authLimiter, async (req, res) => {
@@ -2863,6 +3016,140 @@ app.get('/api/dns/cname-target', (req, res) => {
     res.json({ cnameTarget: getCnameTarget(req) });
 });
 
+// ==================== LINK SETTINGS UPDATE (Features 1, 2, 6, 7, 19) ====================
+// Single endpoint to update all per-link settings (max clicks, PIN, webhook,
+// active hours, cloaker profile). All fields are optional — undefined fields
+// are left unchanged; explicit null clears the value.
+app.patch('/api/links/:id/settings', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const link = await db.get('SELECT id, accessPin FROM links WHERE id = ? AND ownerId = ? AND deletedAt IS NULL', [req.params.id, req.user.id]);
+        if (!link) return res.status(404).json({ error: 'Link not found' });
+
+        const updates = [];
+        const values = [];
+        const body = req.body || {};
+
+        if ('maxClicks' in body) {
+            const v = body.maxClicks;
+            if (v === null || v === '' || v === undefined) {
+                updates.push('maxClicks = NULL');
+            } else {
+                const n = Number(v);
+                if (!Number.isFinite(n) || n < 0 || n > 1e9) {
+                    return res.status(400).json({ error: 'maxClicks must be a non-negative number' });
+                }
+                updates.push('maxClicks = ?'); values.push(Math.floor(n));
+            }
+        }
+        if ('expiresAt' in body) {
+            if (body.expiresAt === null || body.expiresAt === '') {
+                updates.push('expiresAt = NULL');
+            } else {
+                const d = new Date(body.expiresAt);
+                if (isNaN(d.getTime())) return res.status(400).json({ error: 'expiresAt must be a valid date' });
+                updates.push('expiresAt = ?'); values.push(d.toISOString());
+            }
+        }
+        if ('accessPin' in body) {
+            if (body.accessPin === null || body.accessPin === '') {
+                updates.push('accessPin = NULL');
+            } else {
+                try {
+                    const hash = await featuresExtra.hashAccessPin(body.accessPin);
+                    updates.push('accessPin = ?'); values.push(hash);
+                } catch (e) { return res.status(400).json({ error: e.message }); }
+            }
+        }
+        if ('webhookUrl' in body) {
+            if (body.webhookUrl === null || body.webhookUrl === '') {
+                updates.push('webhookUrl = NULL');
+            } else {
+                const u = String(body.webhookUrl).trim();
+                if (!/^https?:\/\//i.test(u)) return res.status(400).json({ error: 'webhookUrl must be http(s)' });
+                updates.push('webhookUrl = ?'); values.push(u);
+            }
+        }
+        if ('activeFromHour' in body || 'activeToHour' in body || 'activeTimezone' in body) {
+            const fromH = body.activeFromHour;
+            const toH = body.activeToHour;
+            const tz = body.activeTimezone;
+            const validHour = h => h === null || h === '' || h === undefined || (Number.isInteger(Number(h)) && Number(h) >= 0 && Number(h) <= 23);
+            if (!validHour(fromH) || !validHour(toH)) {
+                return res.status(400).json({ error: 'activeFromHour and activeToHour must be 0-23' });
+            }
+            if ('activeFromHour' in body) { updates.push('activeFromHour = ?'); values.push(fromH === '' || fromH === null ? null : Number(fromH)); }
+            if ('activeToHour'   in body) { updates.push('activeToHour = ?');   values.push(toH   === '' || toH   === null ? null : Number(toH)); }
+            if ('activeTimezone' in body) { updates.push('activeTimezone = ?'); values.push(tz ? String(tz).slice(0, 64) : null); }
+        }
+        if ('cloakerProfile' in body) {
+            const valid = ['fast', 'balanced', 'stealth', null, ''];
+            const v = body.cloakerProfile;
+            if (!valid.includes(v) && !(typeof v === 'string' && Object.keys(featuresExtra.CLOAKER_PRESETS).includes(v.toLowerCase()))) {
+                return res.status(400).json({ error: 'cloakerProfile must be fast, balanced, or stealth' });
+            }
+            updates.push('cloakerProfile = ?'); values.push(v ? String(v).toLowerCase() : null);
+        }
+        if ('singleUse' in body) {
+            updates.push('singleUse = ?'); values.push(body.singleUse ? 1 : 0);
+        }
+
+        if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(link.id);
+        await db.run(`UPDATE links SET ${updates.join(', ')} WHERE id = ?`, values);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(chalk.red('[LINK-SETTINGS]'), err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==================== USER WEBHOOK (account-level fallback for Feature 6) ====================
+app.patch('/api/me/webhook', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const url = req.body && req.body.webhookUrl;
+        if (url === null || url === '' || url === undefined) {
+            await db.run('UPDATE users SET webhookUrl = NULL WHERE id = ?', [req.user.id]);
+            return res.json({ success: true, webhookUrl: null });
+        }
+        if (!/^https?:\/\//i.test(String(url))) {
+            return res.status(400).json({ error: 'webhookUrl must be http(s)' });
+        }
+        await db.run('UPDATE users SET webhookUrl = ? WHERE id = ?', [String(url).trim(), req.user.id]);
+        res.json({ success: true, webhookUrl: String(url).trim() });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== DESTINATION RULES UPDATE (Feature 3) ====================
+// PATCH a single rotation row's targeting rules.
+app.patch('/api/links/:id/destinations/:destId/rules', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const link = await db.get('SELECT id FROM links WHERE id = ? AND ownerId = ? AND deletedAt IS NULL', [req.params.id, req.user.id]);
+        if (!link) return res.status(404).json({ error: 'Link not found' });
+        const dest = await db.get('SELECT id FROM link_destinations WHERE id = ? AND linkId = ?', [req.params.destId, link.id]);
+        if (!dest) return res.status(404).json({ error: 'Destination not found' });
+        let rules = req.body && req.body.rules;
+        if (rules === null || rules === '' || rules === undefined) {
+            await db.run('UPDATE link_destinations SET rules = NULL WHERE id = ?', [dest.id]);
+            return res.json({ success: true, rules: null });
+        }
+        // Validate: must be a JSON object with allowed keys
+        if (typeof rules === 'string') {
+            try { rules = JSON.parse(rules); } catch (e) { return res.status(400).json({ error: 'rules must be valid JSON' }); }
+        }
+        if (!rules || typeof rules !== 'object' || Array.isArray(rules)) {
+            return res.status(400).json({ error: 'rules must be a JSON object' });
+        }
+        const allowed = ['countries', 'deny_countries', 'devices', 'asnDeny', 'hours'];
+        const filtered = {};
+        for (const k of allowed) if (k in rules) filtered[k] = rules[k];
+        await db.run('UPDATE link_destinations SET rules = ? WHERE id = ?', [JSON.stringify(filtered), dest.id]);
+        res.json({ success: true, rules: filtered });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('*', (req, res) => {
     // Block dashboard access on link domain
     if (isLinkDomainRequest(req)) {
@@ -2918,6 +3205,103 @@ function runStartupSelfCheck() {
     }
 }
 runStartupSelfCheck();
+
+// ==================== BACKGROUND SCHEDULERS ====================
+// Disabled in test/smoke runs to keep tests deterministic.
+const SCHEDULERS_DISABLED = process.env.NODE_ENV === 'test';
+
+// Feature 13: Domain warmup / health auto-pause.
+// Every 5 minutes, scan custom_domains for any whose recent bot rate
+// exceeds the threshold; flip isActive=false on the links using that
+// domain and broadcast a WS event so the dashboard updates live.
+// Uses the same `bot_redirect_events` table the existing health endpoint reads.
+const DOMAIN_AUTOPAUSE_THRESHOLD = 0.85;       // 85% bot ratio
+const DOMAIN_AUTOPAUSE_MIN_HITS = 20;          // require enough sample size
+const DOMAIN_AUTOPAUSE_WINDOW_MIN = 15;        // last 15 minutes
+async function runDomainAutoPauseScan() {
+    try {
+        const db = await getDb();
+        const rows = await db.all(`
+            SELECT l.id, l.ownerId, l.domain,
+                   COUNT(c.id) as totalHits,
+                   SUM(CASE WHEN c.isBot = 1 THEN 1 ELSE 0 END) as botHits
+            FROM links l
+            LEFT JOIN clicks c ON c.linkId = l.id
+                AND c.timestamp >= datetime('now', '-${DOMAIN_AUTOPAUSE_WINDOW_MIN} minutes')
+            WHERE l.isActive = 1 AND l.deletedAt IS NULL
+            GROUP BY l.id
+            HAVING totalHits >= ${DOMAIN_AUTOPAUSE_MIN_HITS}
+        `);
+        for (const r of rows) {
+            const ratio = r.totalHits > 0 ? (r.botHits || 0) / r.totalHits : 0;
+            if (ratio >= DOMAIN_AUTOPAUSE_THRESHOLD) {
+                await db.run('UPDATE links SET isActive = 0 WHERE id = ?', [r.id]);
+                console.log(chalk.red(`[AUTOPAUSE] Link ${r.id} paused (${Math.round(ratio*100)}% bot rate over ${DOMAIN_AUTOPAUSE_WINDOW_MIN}min)`));
+                if (r.ownerId) {
+                    broadcastToUser(r.ownerId, 'LINK_AUTOPAUSED', {
+                        linkId: r.id, botRatio: ratio, windowMinutes: DOMAIN_AUTOPAUSE_WINDOW_MIN,
+                        timestamp: Date.now()
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(chalk.yellow('[AUTOPAUSE] scan error:'), e.message);
+    }
+}
+
+// Feature 16: Click anomaly alerts (3σ deviation).
+// Every hour, for each active link, compute current-hour click count, update
+// rolling baseline, and if the count exceeds mean + 3σ, broadcast an alert.
+async function runAnomalyScan() {
+    try {
+        const db = await getDb();
+        const linkIds = await db.all(`
+            SELECT id, ownerId FROM links
+            WHERE deletedAt IS NULL AND isActive = 1
+        `);
+        for (const link of linkIds) {
+            const row = await db.get(
+                `SELECT COUNT(*) as c FROM clicks
+                 WHERE linkId = ?
+                   AND timestamp >= datetime('now', '-1 hour')
+                   AND isBot = 0`,
+                [link.id]
+            );
+            const count = (row && row.c) || 0;
+            // Detect BEFORE updating so a single huge hour can't poison its own baseline
+            const anomaly = await featuresExtra.detectAnomaly(link.id, count);
+            await featuresExtra.updateAnomalyBaseline(link.id, count);
+            if (anomaly && link.ownerId) {
+                // Throttle: don't alert more than once per 6h per link
+                const last = await db.get('SELECT lastAlertAt FROM link_anomaly_baselines WHERE linkId = ?', [link.id]);
+                const lastMs = last && last.lastAlertAt ? Date.parse(last.lastAlertAt) : 0;
+                if (Date.now() - lastMs > 6 * 60 * 60 * 1000) {
+                    broadcastToUser(link.ownerId, 'CLICK_ANOMALY', {
+                        linkId: link.id,
+                        zScore: Number(anomaly.z.toFixed(2)),
+                        currentHourCount: anomaly.currentHourCount,
+                        baseline: { mean: anomaly.mean, stddev: anomaly.stddev },
+                        timestamp: Date.now()
+                    });
+                    await db.run('UPDATE link_anomaly_baselines SET lastAlertAt = CURRENT_TIMESTAMP WHERE linkId = ?', [link.id]);
+                    console.log(chalk.magenta(`[ANOMALY] Link ${link.id} clicks=${count} z=${anomaly.z.toFixed(2)} -> alert sent`));
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(chalk.yellow('[ANOMALY] scan error:'), e.message);
+    }
+}
+
+if (!SCHEDULERS_DISABLED) {
+    // Stagger initial runs so they don't compete on startup
+    setTimeout(() => { runDomainAutoPauseScan(); }, 60 * 1000);
+    setInterval(runDomainAutoPauseScan, 5 * 60 * 1000);
+    setTimeout(() => { runAnomalyScan(); }, 90 * 1000);
+    setInterval(runAnomalyScan, 60 * 60 * 1000);
+    console.log(chalk.cyan('[SCHEDULER] Domain auto-pause (5min) and anomaly scan (1h) registered.'));
+}
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
