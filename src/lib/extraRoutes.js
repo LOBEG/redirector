@@ -42,12 +42,16 @@ function buildExtraRouter(deps) {
 
     const router = express.Router();
 
+    // Each route below also takes `apiLimiter` explicitly so static analyzers
+    // (CodeQL `js/missing-rate-limiting`) can see the wiring even without
+    // tracking `router.use(...)` middleware flow.
+
     // ============================================================
     // Feature 4: QR code SVG for short links
     //   GET /api/short-links/:slug/qr.svg  (cache-friendly, public)
     //   GET /api/links/:id/qr.svg          (auth required)
     // ============================================================
-    router.get('/api/short-links/:slug/qr.svg', async (req, res) => {
+    router.get('/api/short-links/:slug/qr.svg', apiLimiter, async (req, res) => {
         try {
             const db = await getDb();
             const link = await db.get(
@@ -264,7 +268,7 @@ function buildExtraRouter(deps) {
     });
 
     // Public dashboard — NO PII, numbers only.
-    router.get('/pub/stats/:token', async (req, res) => {
+    router.get('/pub/stats/:token', apiLimiter, async (req, res) => {
         try {
             const db = await getDb();
             const row = await db.get('SELECT * FROM analytics_share_tokens WHERE token = ?', [req.params.token]);
@@ -448,11 +452,16 @@ function buildExtraRouter(deps) {
                     counts.templates++;
                 }
             }
-            // Short links — generate fresh slugs to avoid collisions
+            // Short links — generate fresh slugs to avoid collisions. Truncate
+            // the original slug if necessary so the combined value (including
+            // the random suffix) stays within the 32-char DB limit.
             if (Array.isArray(data.shortLinks)) {
+                const MAX_SLUG = 32;
+                const SUFFIX_LEN = 5; // '-' + 4 hex chars
                 for (const s of data.shortLinks) {
                     if (!s.targetUrl) continue;
-                    const newSlug = s.slug + '-' + crypto.randomBytes(2).toString('hex');
+                    const baseSlug = String(s.slug || 'imp').slice(0, Math.max(1, MAX_SLUG - SUFFIX_LEN));
+                    const newSlug = baseSlug + '-' + crypto.randomBytes(2).toString('hex');
                     try {
                         await db.run(
                             'INSERT INTO short_links (slug, targetUrl, ownerId, title, expiresAt, isActive, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -488,7 +497,7 @@ function buildExtraRouter(deps) {
     // ============================================================
     // Feature 17: Token preview helper — exposes new token names
     // ============================================================
-    router.get('/api/templates/tokens-extended', (req, res) => {
+    router.get('/api/templates/tokens-extended', apiLimiter, (req, res) => {
         res.json({
             tokens: [
                 '%%DESTINATION_URL%%', '%%RAY_ID%%', '%%TIMESTAMP%%',

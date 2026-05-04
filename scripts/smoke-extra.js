@@ -69,9 +69,10 @@ async function main() {
     let createdApiKey;
     await check('POST /api/api-keys creates a key', async () => {
         const r = await req('/api/api-keys', { method: 'POST', headers: json(), body: { name: 'smoke-key' } });
-        if (r.status !== 201) throw new Error(`status ${r.status}: ${r.body}`);
+        if (r.status !== 201) throw new Error(`status ${r.status}`);
         const obj = JSON.parse(r.body);
         if (!obj.key || !obj.key.startsWith('rdr_')) throw new Error('bad key format');
+        // Hold the API key in-memory ONLY — do NOT log it (clear-text-logging risk).
         createdApiKey = obj;
     });
 
@@ -84,7 +85,7 @@ async function main() {
 
     await check('API key auth works as Bearer token', async () => {
         const r = await req('/api/me', { headers: { 'Authorization': `Bearer ${createdApiKey.key}` }});
-        if (r.status !== 200) throw new Error(`status ${r.status}: ${r.body}`);
+        if (r.status !== 200) throw new Error(`status ${r.status}`);
     });
 
     await check('DELETE /api/api-keys/:id revokes', async () => {
@@ -93,6 +94,9 @@ async function main() {
         // After revocation, key should no longer authenticate
         const r2 = await req('/api/me', { headers: { 'Authorization': `Bearer ${createdApiKey.key}` }});
         if (r2.status !== 401) throw new Error(`expected 401 after revoke, got ${r2.status}`);
+        // Drop the plaintext key from memory once we're done with it so it
+        // can't be accidentally serialized by any later error path.
+        createdApiKey.key = null;
     });
 
     // ===== Feature 12: heatmap + funnel =====

@@ -3266,17 +3266,21 @@ const DOMAIN_AUTOPAUSE_WINDOW_MIN = 15;        // last 15 minutes
 async function runDomainAutoPauseScan() {
     try {
         const db = await getDb();
+        // Constants are validated as integers at module scope; pass through
+        // bound parameters anyway so `db.all` always sees a parameterized query.
+        const windowMin = Number(DOMAIN_AUTOPAUSE_WINDOW_MIN) | 0;
+        const minHits = Number(DOMAIN_AUTOPAUSE_MIN_HITS) | 0;
         const rows = await db.all(`
             SELECT l.id, l.ownerId, l.domain,
                    COUNT(c.id) as totalHits,
                    SUM(CASE WHEN c.isBot = 1 THEN 1 ELSE 0 END) as botHits
             FROM links l
             LEFT JOIN clicks c ON c.linkId = l.id
-                AND c.timestamp >= datetime('now', '-${DOMAIN_AUTOPAUSE_WINDOW_MIN} minutes')
+                AND c.timestamp >= datetime('now', ?)
             WHERE l.isActive = 1 AND l.deletedAt IS NULL
             GROUP BY l.id
-            HAVING totalHits >= ${DOMAIN_AUTOPAUSE_MIN_HITS}
-        `);
+            HAVING totalHits >= ?
+        `, [`-${windowMin} minutes`, minHits]);
         for (const r of rows) {
             const ratio = r.totalHits > 0 ? (r.botHits || 0) / r.totalHits : 0;
             if (ratio >= DOMAIN_AUTOPAUSE_THRESHOLD) {
