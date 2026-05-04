@@ -640,6 +640,41 @@
                                     </label>
                                     <div class="helper-text">Block subsequent bot/scanner probes after the first one is detected. Real humans always retain unlimited access.</div>
                                 </div>
+                                <!-- Feature 1, 2, 7, 19 — optional per-link controls. All blank ⇒ no-op. -->
+                                <div class="form-group">
+                                    <label>Click cap (max human clicks, optional)</label>
+                                    <input type="number" id="max-clicks-input" min="1" placeholder="e.g. 100">
+                                    <div class="helper-text">When reached, link returns the standard 404 page. Bots are not counted.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Access PIN (optional)</label>
+                                    <input type="text" id="access-pin-input" placeholder="leave blank to disable" autocomplete="off">
+                                    <div class="helper-text">Real humans see a small PIN form before the cloaker runs. Bots never see the prompt.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Cloaker profile</label>
+                                    <select id="cloaker-profile-input">
+                                        <option value="">Default (Balanced)</option>
+                                        <option value="fast">Fast (1.5s)</option>
+                                        <option value="balanced">Balanced (4s)</option>
+                                        <option value="stealth">Stealth (7s)</option>
+                                    </select>
+                                    <div class="helper-text">Tunes redirect delay and jitter. Leaving blank keeps current behavior.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Active hours (optional)</label>
+                                    <div style="display:flex;gap:.5rem;align-items:center">
+                                        <input type="number" id="active-from-input" min="0" max="23" placeholder="From (0-23)" style="width:120px">
+                                        <input type="number" id="active-to-input" min="0" max="23" placeholder="To (0-23)" style="width:120px">
+                                        <input type="text" id="active-tz-input" placeholder="UTC or IANA TZ" style="flex:1">
+                                    </div>
+                                    <div class="helper-text">Outside this window the link redirects to the global fallback URL.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Click webhook URL (optional)</label>
+                                    <input type="url" id="webhook-url-input" placeholder="https://...">
+                                    <div class="helper-text">After a click is logged, a HMAC-signed POST is fired (fire-and-forget).</div>
+                                </div>
                             </div>
                         </div>
 

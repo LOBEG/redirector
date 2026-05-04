@@ -755,6 +755,16 @@ const app = {
             templateId: this.ui.linkTemplateSelect.value ? parseInt(this.ui.linkTemplateSelect.value) : undefined,
             singleUse: this.ui.singleUseInput ? this.ui.singleUseInput.checked : false
         };
+        // Optional per-link settings (Features 1, 2, 6, 7, 19) — only attached
+        // when the user filled them in. Server treats absent fields as no-op.
+        const _val = (id) => { const el = document.getElementById(id); return el && el.value.trim() ? el.value.trim() : null; };
+        const _maxClicks = _val('max-clicks-input');     if (_maxClicks)   linkData.maxClicks = Number(_maxClicks);
+        const _accessPin = _val('access-pin-input');     if (_accessPin)   linkData.accessPin = _accessPin;
+        const _cloakerProfile = _val('cloaker-profile-input'); if (_cloakerProfile) linkData.cloakerProfile = _cloakerProfile;
+        const _from = _val('active-from-input');         if (_from !== null) linkData.activeFromHour = Number(_from);
+        const _to   = _val('active-to-input');           if (_to !== null)   linkData.activeToHour = Number(_to);
+        const _tz   = _val('active-tz-input');           if (_tz)            linkData.activeTimezone = _tz;
+        const _wh   = _val('webhook-url-input');         if (_wh)            linkData.webhookUrl = _wh;
         try {
             const newLink = await this.handleApiCall('/api/links', {
                 method: 'POST',

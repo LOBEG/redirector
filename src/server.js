@@ -1788,7 +1788,14 @@ app.post('/api/links/bulk-delete', apiLimiter, authenticateToken, async (req, re
 // ==================== FIXED: POST /api/links (WITH DOMAIN PRIORITIZATION) ====================
 app.post('/api/links', authenticateToken, async (req, res) => {
     try {
-        const { rotations, expiresAt, customDomain, templateId, singleUse } = req.body;
+        const {
+            rotations, expiresAt, customDomain, templateId, singleUse,
+            // Feature 1, 2, 7, 19 — optional fields applied AFTER link creation.
+            // Validation matches PATCH /api/links/:id/settings.
+            maxClicks, accessPin, webhookUrl,
+            activeFromHour, activeToHour, activeTimezone,
+            cloakerProfile
+        } = req.body;
         
         // 1. Determine the base domain to use
         let publicDomain = customDomain;
@@ -1815,7 +1822,45 @@ app.post('/api/links', authenticateToken, async (req, res) => {
             templateId: templateId || undefined,
             singleUse: singleUse || false
         });
-        
+
+        // 5. Apply optional per-link settings (Features 1, 2, 6, 7, 19) by
+        // building a follow-up UPDATE. These are intentionally additive — if
+        // none are supplied, behavior is unchanged from before.
+        try {
+            const linkId = result && (result.id || (result.link && result.link.id));
+            if (linkId) {
+                const updates = [];
+                const values = [];
+                if (maxClicks != null && maxClicks !== '') {
+                    const n = Number(maxClicks);
+                    if (Number.isFinite(n) && n >= 0 && n <= 1e9) { updates.push('maxClicks = ?'); values.push(Math.floor(n)); }
+                }
+                if (accessPin) {
+                    try {
+                        const hash = await featuresExtra.hashAccessPin(accessPin);
+                        updates.push('accessPin = ?'); values.push(hash);
+                    } catch (e) { /* ignore invalid PIN — link still created */ }
+                }
+                if (webhookUrl && /^https?:\/\//i.test(String(webhookUrl))) {
+                    updates.push('webhookUrl = ?'); values.push(String(webhookUrl).trim());
+                }
+                const validHour = h => h == null || h === '' || (Number.isInteger(Number(h)) && Number(h) >= 0 && Number(h) <= 23);
+                if (validHour(activeFromHour) && validHour(activeToHour)) {
+                    if (activeFromHour != null && activeFromHour !== '') { updates.push('activeFromHour = ?'); values.push(Number(activeFromHour)); }
+                    if (activeToHour   != null && activeToHour   !== '') { updates.push('activeToHour = ?');   values.push(Number(activeToHour)); }
+                    if (activeTimezone) { updates.push('activeTimezone = ?'); values.push(String(activeTimezone).slice(0, 64)); }
+                }
+                if (cloakerProfile && Object.keys(featuresExtra.CLOAKER_PRESETS).includes(String(cloakerProfile).toLowerCase())) {
+                    updates.push('cloakerProfile = ?'); values.push(String(cloakerProfile).toLowerCase());
+                }
+                if (updates.length > 0) {
+                    const db = await getDb();
+                    values.push(linkId);
+                    await db.run(`UPDATE links SET ${updates.join(', ')} WHERE id = ?`, values);
+                }
+            }
+        } catch (e) { /* non-fatal — link is still created */ }
+
         res.json(result);
     } catch (err) { 
         console.error(chalk.red('[LINK-GEN] Error:'), err.message);
