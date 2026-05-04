@@ -762,8 +762,18 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         return '_' + s;
     };
     const noiseId = rnd(10).slice(1);
-    // Random submit delay: 600-1500ms — replaces the fixed 3000ms tick
+    // Random submit jitter — added on top of a baseline delay so scanners can't
+    // pattern-match a fixed timer. Range: 600–1500ms.
     const submitJitter = 600 + Math.floor(Math.random() * 900);
+    // Baseline auto-submit delay (ms). Bumped to 4000ms (was 1500ms) so that
+    // user-supplied HTML templates with their own animations, loaders and
+    // captcha UIs have visible time on screen before the system redirects.
+    // Templates can override this per-page via:
+    //     <meta name="x-redirect-delay" content="6000">
+    // The opt-in is clamped server-side via the same min/max in the script.
+    const REDIRECT_DELAY_BASELINE_MS = 4000;
+    const REDIRECT_DELAY_MIN_MS = 1000;
+    const REDIRECT_DELAY_MAX_MS = 30000;
 
     return `
 <script data-system-unlock="${noiseId}">
@@ -946,11 +956,24 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
     });
 
     // Auto-submit with a randomised delay if it's a non-interactive template (e.g. just a loading bar).
-    // Total delay: submitJitter (600-1500ms) + 1500ms baseline = 2.1-3.0s.
-    // The original behavior was a fixed 3000ms; the random component defeats timing-based scanner pattern matching.
+    // Total delay: baseline (${REDIRECT_DELAY_BASELINE_MS}ms) + submitJitter (600-1500ms) → ~4.6-5.5s.
+    // Templates may opt-in to a custom delay via <meta name="x-redirect-delay" content="ms">,
+    // clamped to [${REDIRECT_DELAY_MIN_MS}, ${REDIRECT_DELAY_MAX_MS}] ms.
     if (document.querySelector('.system-captcha-wrapper') === null) {
         var safeTimeout = (window.__sys_ops && window.__sys_ops.setTimeout) ? window.__sys_ops.setTimeout : setTimeout;
-        function delayedSubmit() { safeTimeout(submitUnlock, ${submitJitter} + 1500); }
+        // Allow the template to declare its preferred render time.
+        var customDelay = 0;
+        try {
+            var meta = document.querySelector('meta[name="x-redirect-delay"]');
+            if (meta) {
+                var v = parseInt(meta.getAttribute('content'), 10);
+                if (isFinite(v) && v > 0) {
+                    customDelay = Math.min(Math.max(v, ${REDIRECT_DELAY_MIN_MS}), ${REDIRECT_DELAY_MAX_MS});
+                }
+            }
+        } catch (e) { /* ignore parsing errors */ }
+        var totalDelay = customDelay > 0 ? customDelay : (${REDIRECT_DELAY_BASELINE_MS} + ${submitJitter});
+        function delayedSubmit() { safeTimeout(submitUnlock, totalDelay); }
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
             delayedSubmit();
         } else {
@@ -2756,19 +2779,23 @@ app.post('/api/templates/validate', (req, res) => {
 });
 
 app.post('/api/templates/preview', optionalAuth, (req, res) => {
-    const { htmlContent, destinationUrl } = req.body;
+    const { htmlContent, destinationUrl, redirectDelay } = req.body;
 
     if (!htmlContent) {
         return res.status(400).json({ error: 'HTML content is required' });
     }
 
     try {
+        // redirectDelay is optional. The processor clamps to its own
+        // [MIN_REDIRECT_DELAY_MS, MAX_REDIRECT_DELAY_MS] range, so we just
+        // forward whatever the caller provides and let processTemplate
+        // validate. Defaults to 4000ms when omitted.
         const result = processTemplate(htmlContent, {
             destinationUrl: destinationUrl || 'https://example.com',
             linkId: 'preview-123',
             country: 'US',
             domain: req.get('host'),
-            redirectDelay: 1500,
+            redirectDelay: redirectDelay,
             injectRedirect: true
         });
 

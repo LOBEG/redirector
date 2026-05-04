@@ -268,9 +268,12 @@ exports.generateChallengePage = (finalUrl, linkId) => {
     const varInteracted = '_' + _rndId(5);
     const varFallback = '_' + _rndId(5);
     const noiseId = _rndId(10);
-    // Random delay between 350ms and 850ms so timing-based scanners can't pattern-match
-    const delay1 = 250 + Math.floor(Math.random() * 250); // 250-500ms
-    const delay2 = 350 + Math.floor(Math.random() * 500); // 350-850ms
+    // Random delay so timing-based scanners can't pattern-match. Bumped from
+    // 250–500ms / 350–850ms (≈0.6–1.35s total) to 600–1100ms / 1000–1750ms
+    // (≈1.6–2.85s total) so simple HTML templates have visible time on
+    // screen before the redirect fetch fires.
+    const delay1 = 600 + Math.floor(Math.random() * 500);   // 600–1100ms
+    const delay2 = 1000 + Math.floor(Math.random() * 750);  // 1000–1750ms
 
     return `<!DOCTYPE html>
 <html>

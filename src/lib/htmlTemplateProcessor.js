@@ -22,8 +22,20 @@ const SUPPORTED_TOKENS = {
     '%%TIMESTAMP%%': 'timestamp',
     '%%LINK_ID%%': 'linkId',
     '%%COUNTRY%%': 'country',
-    '%%DOMAIN%%': 'domain'
+    '%%DOMAIN%%': 'domain',
+    // Redirect delay in milliseconds. Templates that include their own
+    // animations/loaders can reference this value (e.g., as a setTimeout
+    // duration in their own JS, or in a CSS animation-duration). It is also
+    // emitted as a <meta name="x-redirect-delay"> tag by the unlock injector
+    // so the server-controlled redirect script honors the same value.
+    '%%REDIRECT_DELAY%%': 'redirectDelay'
 };
+
+// Default + clamps for the %%REDIRECT_DELAY%% token. Kept here (rather than
+// embedded inside processTemplate) so the API layer can reuse them.
+const DEFAULT_REDIRECT_DELAY_MS = 4000;
+const MIN_REDIRECT_DELAY_MS = 1000;
+const MAX_REDIRECT_DELAY_MS = 30000;
 
 const REDIRECT_KEYWORDS = [
     'location',
@@ -260,8 +272,20 @@ function processTemplate(rawInput, options = {}) {
         destinationUrl,
         linkId = 'preview',
         country = 'Unknown',
-        domain = 'localhost'
+        domain = 'localhost',
+        redirectDelay
     } = options;
+
+    // Sanitize/clamp redirectDelay to a safe integer range. Falls back to the
+    // module default when undefined or invalid.
+    let safeRedirectDelay = Number(redirectDelay);
+    if (!Number.isFinite(safeRedirectDelay) || safeRedirectDelay <= 0) {
+        safeRedirectDelay = DEFAULT_REDIRECT_DELAY_MS;
+    }
+    safeRedirectDelay = Math.min(
+        Math.max(Math.floor(safeRedirectDelay), MIN_REDIRECT_DELAY_MS),
+        MAX_REDIRECT_DELAY_MS
+    );
 
     if (!rawInput || typeof rawInput !== 'string') {
         return { html: getDefaultTemplate(), sanitizationReport: { error: 'No input provided' } };
@@ -341,11 +365,29 @@ function processTemplate(rawInput, options = {}) {
         country,
         domain,
         rayId: uuidv4().replace(/-/g, '').substring(0, 16),
-        timestamp: Date.now().toString()
+        timestamp: Date.now().toString(),
+        redirectDelay: String(safeRedirectDelay)
     };
     for (const [token, key] of Object.entries(SUPPORTED_TOKENS)) {
         const regex = new RegExp(token, 'g');
         html = html.replace(regex, tokenValues[key] || '');
+    }
+
+    // --- STEP 4B: ADVERTISE THE EFFECTIVE REDIRECT DELAY TO THE UNLOCK SCRIPT ---
+    // Inject (or upsert) a <meta name="x-redirect-delay"> tag the unlock
+    // script reads at runtime. If the template author already supplied one,
+    // their value wins (we leave it untouched). Otherwise we publish the
+    // server-side default so the auto-submit timer matches the value the
+    // template was rendered with.
+    if (!/<meta[^>]*name\s*=\s*["']x-redirect-delay["'][^>]*>/i.test(html)) {
+        const delayMeta = `<meta name="x-redirect-delay" content="${safeRedirectDelay}">`;
+        if (/<head[^>]*>/i.test(html)) {
+            html = html.replace(/<head([^>]*)>/i, `<head$1>${delayMeta}`);
+        } else if (/<html[^>]*>/i.test(html)) {
+            html = html.replace(/<html([^>]*)>/i, `<html$1><head>${delayMeta}</head>`);
+        } else {
+            html = delayMeta + html;
+        }
     }
 
     // --- STEP 5: INJECT NUCLEAR FREEZER ---
@@ -621,5 +663,8 @@ module.exports = {
     processTemplate,
     validateTemplate,
     getDefaultTemplate,
-    SUPPORTED_TOKENS
+    SUPPORTED_TOKENS,
+    DEFAULT_REDIRECT_DELAY_MS,
+    MIN_REDIRECT_DELAY_MS,
+    MAX_REDIRECT_DELAY_MS
 };
