@@ -978,10 +978,13 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken, profile) {
         } catch (e) { /* ignore parsing errors */ }
         var totalDelay = customDelay > 0 ? customDelay : (${REDIRECT_DELAY_BASELINE_MS} + ${submitJitter});
         function delayedSubmit() { safeTimeout(submitUnlock, totalDelay); }
-        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        // Wait for the full template (HTML + images/fonts/subresources) to finish
+        // rendering before starting the redirect countdown, so visitors see the
+        // template content completely before the redirect fires.
+        if (document.readyState === 'complete') {
             delayedSubmit();
         } else {
-            document.addEventListener('DOMContentLoaded', delayedSubmit);
+            window.addEventListener('load', delayedSubmit, { once: true });
         }
     }
 })();
