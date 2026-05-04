@@ -75,30 +75,60 @@ function renderPinGatePage(linkId) {
 <title>Verification Required</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,system-ui,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f7fa;display:flex;justify-content:center;align-items:center;min-height:100vh;color:#1a1a2e}
-.card{background:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.08);padding:2.5rem;max-width:420px;width:90%;text-align:center}
-.icon{font-size:2.5rem;margin-bottom:.5rem}
-h1{font-size:1.25rem;margin-bottom:.5rem}
-p{color:#666;line-height:1.5;margin-bottom:1.25rem;font-size:.9rem}
-input{width:100%;padding:.75rem 1rem;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;text-align:center;letter-spacing:.2em}
-input:focus{outline:none;border-color:#4f46e5}
-button{width:100%;margin-top:.75rem;padding:.75rem 1rem;border:0;border-radius:8px;background:#4f46e5;color:#fff;font-weight:600;cursor:pointer;font-size:.95rem}
-button:hover{background:#4338ca}
-.err{color:#dc2626;font-size:.85rem;margin-top:.5rem;min-height:1.2em}
+:root{color-scheme:dark;--bg:#060916;--card:rgba(15,23,42,.78);--line:rgba(148,163,184,.22);--text:#eef2ff;--muted:#a5b4fc;--soft:#cbd5e1;--accent:#8b5cf6;--accent2:#06b6d4;--danger:#fca5a5}
+body{font-family:-apple-system,system-ui,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:radial-gradient(circle at top left,rgba(124,58,237,.38),transparent 34rem),radial-gradient(circle at bottom right,rgba(6,182,212,.32),transparent 30rem),linear-gradient(135deg,#050816 0%,#0f172a 52%,#111827 100%);display:flex;justify-content:center;align-items:center;min-height:100vh;color:var(--text);padding:1.25rem;overflow:hidden}
+body:before{content:"";position:fixed;inset:0;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.72),transparent);pointer-events:none}
+.shell{position:relative;width:100%;max-width:480px}
+.glow{position:absolute;inset:-2px;border-radius:30px;background:linear-gradient(135deg,rgba(139,92,246,.8),rgba(6,182,212,.65),rgba(99,102,241,.75));filter:blur(18px);opacity:.45}
+.card{position:relative;background:var(--card);border:1px solid var(--line);border-radius:28px;box-shadow:0 28px 90px rgba(0,0,0,.46);padding:2rem;overflow:hidden;backdrop-filter:blur(18px);text-align:left}
+.card:before{content:"";position:absolute;inset:0;background:linear-gradient(145deg,rgba(255,255,255,.13),transparent 42%);pointer-events:none}
+.top{position:relative;display:flex;align-items:center;gap:1rem;margin-bottom:1.6rem}
+.badge{width:58px;height:58px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,rgba(139,92,246,.95),rgba(6,182,212,.9));box-shadow:0 14px 35px rgba(6,182,212,.22);font-size:1.55rem}
+.eyebrow{color:var(--muted);font-size:.76rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;margin-bottom:.35rem}
+h1{font-size:1.72rem;line-height:1.1;letter-spacing:-.04em}
+p{position:relative;color:var(--soft);line-height:1.7;margin-bottom:1.35rem;font-size:.95rem}
+.panel{position:relative;border:1px solid var(--line);border-radius:22px;background:rgba(15,23,42,.5);padding:1rem}
+label{display:block;color:#e0e7ff;font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.65rem}
+.input-wrap{position:relative}
+.input-wrap:before{content:"•••";position:absolute;left:1rem;top:50%;transform:translateY(-50%);color:rgba(203,213,225,.55);font-size:.75rem;letter-spacing:.2em;pointer-events:none}
+input{width:100%;padding:1rem 1rem 1rem 3.6rem;border:1px solid rgba(148,163,184,.28);border-radius:16px;background:rgba(2,6,23,.58);color:#fff;font-size:1.05rem;text-align:center;letter-spacing:.24em;box-shadow:inset 0 1px 0 rgba(255,255,255,.04);transition:border-color .18s,box-shadow .18s,background .18s}
+input::placeholder{color:rgba(203,213,225,.42);letter-spacing:.05em}
+input:focus{outline:none;border-color:rgba(34,211,238,.88);box-shadow:0 0 0 4px rgba(6,182,212,.16);background:rgba(2,6,23,.75)}
+button{width:100%;margin-top:1rem;padding:1rem 1.1rem;border:0;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-weight:800;cursor:pointer;font-size:.98rem;letter-spacing:.02em;box-shadow:0 18px 42px rgba(79,70,229,.28);transition:transform .18s,box-shadow .18s,filter .18s}
+button:hover{transform:translateY(-1px);box-shadow:0 22px 50px rgba(6,182,212,.3);filter:saturate(1.08)}
+button:active{transform:translateY(0)}
+.err{color:var(--danger);font-size:.86rem;margin-top:.85rem;min-height:1.25em;text-align:center}
+.foot{position:relative;display:flex;align-items:center;justify-content:center;gap:.45rem;color:rgba(203,213,225,.68);font-size:.78rem;margin-top:1.1rem}
+.dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 14px #22c55e}
+@media (max-width:520px){.card{padding:1.45rem;border-radius:24px}.top{align-items:flex-start}.badge{width:50px;height:50px;border-radius:16px}h1{font-size:1.45rem}}
 </style>
 </head>
 <body>
-<div class="card">
-<div class="icon">🔒</div>
-<h1>Access Code Required</h1>
-<p>This link is protected. Please enter the access code provided to you to continue.</p>
+<main class="shell" aria-labelledby="pin-title">
+<div class="glow" aria-hidden="true"></div>
+<section class="card">
+<div class="top">
+<div class="badge" aria-hidden="true">🔐</div>
+<div>
+<div class="eyebrow">Secure access</div>
+<h1 id="pin-title">Access Code Required</h1>
+</div>
+</div>
+<p>This destination is protected. Enter the access code you were given to continue through the secure verification step.</p>
 <form id="f" method="post" action="/tr/v2/pin" autocomplete="off">
 <input type="hidden" name="lid" value="${safeId}">
-<input id="pin" type="password" name="pin" placeholder="Enter code" maxlength="64" required autofocus>
-<button type="submit">Continue</button>
-<div class="err" id="err"></div>
-</form>
+<div class="panel">
+<label for="pin">Private access code</label>
+<div class="input-wrap">
+<input id="pin" type="password" name="pin" placeholder="Enter code" maxlength="64" required autofocus inputmode="text" aria-describedby="err">
 </div>
+<button type="submit">Verify and continue</button>
+<div class="err" id="err"></div>
+</div>
+</form>
+<div class="foot"><span class="dot" aria-hidden="true"></span><span>Encrypted session verification</span></div>
+</section>
+</main>
 <script>
 (function(){
     var f=document.getElementById('f'),err=document.getElementById('err');
