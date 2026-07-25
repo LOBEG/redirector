@@ -48,6 +48,13 @@
                 "branch": "main",
                 "buildSHA": "latest"
               },
+              "volumes": [
+                {
+                  "name": "data",
+                  "mountPath": "/data",
+                  "size": 1
+                }
+              ],
               "healthChecks": {
                 "readiness": {
                   "protocol": "HTTP",
@@ -77,7 +84,8 @@
             ],
             "runtimeEnvironment": {
               "NODE_ENV": "production",
-              "PORT": "10000"
+              "PORT": "10000",
+              "NORTHFLANK_VOLUME_MOUNT_PATH": "/data"
             }
           }
         }

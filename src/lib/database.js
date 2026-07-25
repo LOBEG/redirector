@@ -8,8 +8,7 @@ let dbPromise = null;
 async function initializeDatabase() {
     try {
         // Northflank persistent volume path vs local development path.
-        // RAILWAY_VOLUME_MOUNT_PATH is retained only as a backward-compatible fallback for existing deployments.
-        const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH;
+        const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH;
         const dbPath = mountPath 
             ? path.join(mountPath, 'production.db')
             : path.join(__dirname, '../../production.db'); // Stored in project root for local dev
