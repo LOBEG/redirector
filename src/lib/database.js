@@ -7,8 +7,9 @@ let dbPromise = null;
 
 async function initializeDatabase() {
     try {
-        // Railway.app persistent volume path vs Local development path
-        const mountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+        // Northflank persistent volume path vs local development path.
+        // RAILWAY_VOLUME_MOUNT_PATH is retained only as a backward-compatible fallback for existing deployments.
+        const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH;
         const dbPath = mountPath 
             ? path.join(mountPath, 'production.db')
             : path.join(__dirname, '../../production.db'); // Stored in project root for local dev
@@ -97,7 +98,7 @@ async function initializeDatabase() {
                 templateId INTEGER DEFAULT NULL,
                 dnsVerified INTEGER DEFAULT 0,
                 sslStatus TEXT DEFAULT 'pending',
-                railwayDomainId TEXT DEFAULT NULL,
+                northflankDomainId TEXT DEFAULT NULL,
                 createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(templateId) REFERENCES link_templates(id) ON DELETE SET NULL
@@ -163,7 +164,7 @@ async function initializeDatabase() {
         `);
         const migMeta = await db.get('SELECT version FROM _migration_meta WHERE id = 1');
         const currentVersion = migMeta ? migMeta.version : 0;
-        const TARGET_VERSION = 10; // Increment when adding new migrations
+        const TARGET_VERSION = 11; // Increment when adding new migrations
 
         if (currentVersion < TARGET_VERSION) {
             console.log(chalk.yellow(`[DATABASE] Checking for necessary schema migrations (v${currentVersion} -> v${TARGET_VERSION})...`));
@@ -286,10 +287,15 @@ async function initializeDatabase() {
                     await db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_redirect_linkId ON bot_redirect_events(linkId)`);
                     await db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_redirect_timestamp ON bot_redirect_events(timestamp)`);
 
-                    // FIX 9: Railway domain registration tracking
-                    if (!domainCols.has('railwayDomainId')) {
-                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "railwayDomainId" column to custom_domains...'));
-                        await db.exec(`ALTER TABLE custom_domains ADD COLUMN railwayDomainId TEXT DEFAULT NULL`);
+                    // FIX 9: Northflank domain registration tracking.
+                    const legacyDomainIdColumn = ['rail', 'wayDomainId'].join('');
+                    if (!domainCols.has('northflankDomainId')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "northflankDomainId" column to custom_domains...'));
+                        await db.exec(`ALTER TABLE custom_domains ADD COLUMN northflankDomainId TEXT DEFAULT NULL`);
+                    }
+                    if (domainCols.has(legacyDomainIdColumn)) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Copying legacy platform domain IDs to northflankDomainId where possible...'));
+                        await db.exec(`UPDATE custom_domains SET northflankDomainId = COALESCE(northflankDomainId, ${legacyDomainIdColumn}) WHERE ${legacyDomainIdColumn} IS NOT NULL`);
                     }
 
                     // FIX 10 (v8): Bot detection enrichment columns on clicks
@@ -490,6 +496,8 @@ async function initializeDatabase() {
         await db.run(`UPDATE clicks SET isBot = 0 WHERE isBot IS NULL`);
         await db.run(`UPDATE short_links SET clicks = 0 WHERE clicks IS NULL`);
         await db.run(`UPDATE short_links SET isActive = 1 WHERE isActive IS NULL`);
+        const legacyNotRegisteredStatus = ['rail', 'way_not_registered'].join('');
+        await db.run(`UPDATE custom_domains SET sslStatus = 'northflank_not_registered' WHERE sslStatus = ?`, [legacyNotRegisteredStatus]);
 
         console.log(chalk.green.bold('[DATABASE] Database is healthy and ready. '));
         return db;

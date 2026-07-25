@@ -114,7 +114,7 @@ async function main() {
         const r = await get('/');
         if (r.status !== 200) throw new Error('status ' + r.status);
         // Must be the dashboard, not a link-domain 404
-        if (r.body.includes('the train has not arrived')) throw new Error('railway 404');
+        if (r.body.includes('no service found')) throw new Error('northflank unrouted 404');
     });
 
     if (failures > 0) {

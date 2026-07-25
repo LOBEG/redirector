@@ -935,11 +935,11 @@
                                 <code id="cname-target-domains">loading...</code>
                                 <button type="button" id="copy-cname-target-btn" class="btn-copy" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Copy CNAME target to clipboard">Copy</button>
                                 <button type="button" id="check-all-dns-btn" class="btn-secondary" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Run DNS check for every connected domain">🔄 Check All</button>
-                                <br><small><strong>⚠️ Important:</strong> Do NOT use an A record pointing to a Cloudflare IP (e.g., 104.16.x.x, 172.67.x.x). This causes Cloudflare Error 1000 ("DNS points to prohibited IP"). Always use a CNAME record pointing to your platform hostname (e.g., your-app.up.railway.app), NOT to another custom domain.</small>
+                                <br><small><strong>⚠️ Important:</strong> Do NOT use an A record pointing to a Cloudflare IP (e.g., 104.16.x.x, 172.67.x.x). This causes Cloudflare Error 1000 ("DNS points to prohibited IP"). Always use a CNAME record pointing to your platform hostname (e.g., your-service.code.run), NOT to another custom domain.</small>
                                 <br><small><strong>Link Domain:</strong> Used for generating cloaked links (does not expose dashboard). <strong>Web Domain:</strong> Used to access the engine dashboard.</small>
                                 <br><small><strong>SSL Options:</strong> Use Cloudflare (free) with "Full" or "Full (Strict)" SSL mode, or issue an SSL certificate through your domain registrar.</small>
-                                <br><small><strong>💡 Tip:</strong> If the CNAME target above shows "your-app.up.railway.app", set the <code>CNAME_TARGET</code> environment variable to your Railway hostname (e.g., <code>my-service-production.up.railway.app</code>).</small>
-                                <br><small><strong>🚂 Auto-Registration:</strong> Set <code>RAILWAY_TOKEN</code> env var to automatically register custom domains with Railway when you add them here. Generate a token at Railway dashboard → Account → Tokens.</small>
+                                <br><small><strong>💡 Tip:</strong> If the CNAME target above shows "your-service.code.run", set the <code>CNAME_TARGET</code> environment variable to your Northflank hostname (e.g., <code>my-service-production.code.run</code>).</small>
+                                <br><small><strong>🔗 Auto-Registration:</strong> Set <code>NORTHFLANK_API_TOKEN</code> env var to automatically register custom domains with Northflank when you add them here. Generate a token at Northflank dashboard → Account Settings → API Tokens.</small>
                             </div>
                         </div>
 

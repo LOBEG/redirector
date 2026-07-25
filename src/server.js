@@ -86,122 +86,181 @@ const LINK_DOMAIN = (config.linkDomain || '').toLowerCase().replace(/^https?:\/\
 // Allowed path prefixes on the link domain (tracking, unlock, and safe redirect chain routes only)
 const LINK_DOMAIN_ALLOWED_PATHS = ['/tr/', '/p/', '/s/', '/sr/', '/health'];
 
-// Markers in Railway's "Not Found" HTML page — used to detect when a domain is NOT
-// registered as a custom domain in Railway's service settings (traffic reaches Railway
-// via Cloudflare proxy but Railway rejects it with its own branded 404 page).
-const RAILWAY_NOT_FOUND_MARKERS = ['the train has not arrived', 'domain has provisioned', 'go to railway'];
+// Markers in Northflank's default/unrouted HTML pages — used to detect when a domain is NOT
+// linked to this service port in Northflank. These are intentionally conservative and include
+// generic not-found markers so we do not depend on one exact branded page.
+const NORTHFLANK_NOT_FOUND_MARKERS = [
+    'northflank',
+    'no service found',
+    'application not found',
+    'domain is not configured',
+    'no route found',
+    'unrouted domain'
+];
 
-// ==================== RAILWAY API INTEGRATION ====================
-// Auto-register/unregister custom domains with Railway via their GraphQL API.
-// Requires RAILWAY_TOKEN env var (generated in Railway dashboard → Account → Tokens).
-// RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID are auto-injected by Railway at runtime.
+// ==================== NORTHFLANK API INTEGRATION ====================
+// Auto-register/unregister custom domains with Northflank via their REST API.
+// Requires NORTHFLANK_API_TOKEN, NORTHFLANK_PROJECT_ID, and NORTHFLANK_SERVICE_ID env vars.
 
-const RAILWAY_API_URL = 'https://backboard.railway.app/graphql/v2';
+const NORTHFLANK_API_URL = 'https://api.northflank.com';
 
 /**
- * Check if Railway API credentials are configured.
+ * Check if Northflank API credentials are configured.
  */
-function isRailwayApiConfigured() {
-    return !!(config.railwayToken && config.railwayServiceId && config.railwayEnvironmentId);
+function isNorthflankApiConfigured() {
+    return !!(config.northflankApiToken && config.northflankProjectId && config.northflankServiceId);
 }
 
 /**
- * Execute a Railway GraphQL API request.
- * @param {string} query - GraphQL query/mutation
- * @param {object} variables - GraphQL variables
+ * Execute a Northflank REST API request.
+ * @param {string} method - HTTP method
+ * @param {string} apiPath - API path beginning with /v1
+ * @param {object|null} body - JSON body
  * @returns {Promise<object>} - Parsed response data
  */
-function railwayApiRequest(query, variables = {}) {
+function northflankApiRequest(method, apiPath, body = null) {
     return new Promise((resolve, reject) => {
-        const payload = JSON.stringify({ query, variables });
-        const url = new URL(RAILWAY_API_URL);
+        const payload = body ? JSON.stringify(body) : '';
+        const url = new URL(apiPath, NORTHFLANK_API_URL);
+        const headers = {
+            'Accept': 'application/json',
+            'Authorization': 'Bearer ' + config.northflankApiToken,
+        };
+        if (payload) {
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(payload);
+        }
         const options = {
             hostname: url.hostname,
             port: 443,
-            path: url.pathname,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.railwayToken}`,
-                'Content-Length': Buffer.byteLength(payload),
-            },
+            path: url.pathname + url.search,
+            method,
+            headers,
             timeout: 15000,
         };
         const req = https.request(options, (res) => {
-            let body = '';
-            res.on('data', chunk => { body += chunk; });
+            let responseBody = '';
+            res.on('data', chunk => { responseBody += chunk; });
             res.on('end', () => {
-                try {
-                    const data = JSON.parse(body);
-                    if (data.errors && data.errors.length > 0) {
-                        reject(new Error(data.errors[0].message || 'Railway API error'));
-                    } else {
-                        resolve(data.data);
+                let data = {};
+                if (responseBody) {
+                    try {
+                        data = JSON.parse(responseBody);
+                    } catch (e) {
+                        const err = new Error(`Northflank API returned invalid JSON: ${responseBody.slice(0, 200)}`);
+                        err.statusCode = res.statusCode;
+                        return reject(err);
                     }
-                } catch (e) {
-                    reject(new Error(`Railway API returned invalid JSON: ${body.slice(0, 200)}`));
                 }
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    const errMsg = data.message || data.error || data.detail || `Northflank API error (HTTP ${res.statusCode})`;
+                    const err = new Error(errMsg);
+                    err.statusCode = res.statusCode;
+                    err.response = data;
+                    return reject(err);
+                }
+                resolve(data);
             });
         });
-        req.on('error', (e) => reject(new Error(`Railway API connection failed: ${e.message}`)));
-        req.on('timeout', () => { req.destroy(); reject(new Error('Railway API request timed out')); });
-        req.write(payload);
+        req.on('error', (e) => reject(new Error(`Northflank API connection failed: ${e.message}`)));
+        req.on('timeout', () => { req.destroy(); reject(new Error('Northflank API request timed out')); });
+        if (payload) req.write(payload);
         req.end();
     });
 }
 
+async function assignDomainToNorthflank(domain) {
+    const payload = {
+        serviceId: config.northflankServiceId,
+        projectId: config.northflankProjectId,
+        portName: config.northflankPortName || 'p01',
+    };
+    const encodedDomain = encodeURIComponent(domain);
+    const attempts = [
+        `/v1/domains/${encodedDomain}/assign`,
+        `/v1/domains/${encodedDomain}/subdomains/${encodeURIComponent('@')}/assign`,
+    ];
+    let lastError = null;
+    for (const pathToTry of attempts) {
+        try {
+            await northflankApiRequest('POST', pathToTry, payload);
+            return true;
+        } catch (e) {
+            lastError = e;
+            if (e.statusCode && e.statusCode !== 404 && e.statusCode !== 405) throw e;
+        }
+    }
+    if (lastError) throw lastError;
+    return false;
+}
+
 /**
- * Register a custom domain with Railway.
+ * Register and assign a custom domain with Northflank.
  * @param {string} domain - The domain hostname to register
- * @returns {Promise<{id: string, domain: string}|null>} - Railway domain object or null on failure
+ * @returns {Promise<{id: string, domain: string, assigned: boolean}|null>} - Northflank domain object or null on failure
  */
-async function registerDomainWithRailway(domain) {
-    if (!isRailwayApiConfigured()) {
-        console.log(chalk.yellow(`[RAILWAY-API] Skipping domain registration — RAILWAY_TOKEN not configured.`));
+async function registerDomainWithNorthflank(domain) {
+    if (!isNorthflankApiConfigured()) {
+        console.log(chalk.yellow(`[NORTHFLANK-API] Skipping domain registration — NORTHFLANK_API_TOKEN not configured.`));
         return null;
     }
     try {
-        console.log(chalk.blue(`[RAILWAY-API] Registering domain "${domain}" with Railway...`));
-        const data = await railwayApiRequest(
-            `mutation($input: CustomDomainCreateInput!) {
-                customDomainCreate(input: $input) { id domain }
-            }`,
-            {
-                input: {
-                    domain: domain,
-                    serviceId: config.railwayServiceId,
-                    environmentId: config.railwayEnvironmentId,
-                }
+        console.log(chalk.blue(`[NORTHFLANK-API] Registering domain "${domain}" with Northflank...`));
+        let created;
+        try {
+            created = await northflankApiRequest('POST', '/v1/domains', { domain });
+        } catch (e) {
+            const msg = (e.message || '').toLowerCase();
+            if (e.statusCode === 409 || msg.includes('already') || msg.includes('exists')) {
+                console.log(chalk.yellow(`[NORTHFLANK-API] Domain "${domain}" already exists in Northflank; continuing with assignment.`));
+                created = { id: domain, domain, name: domain, alreadyExists: true };
+            } else {
+                throw e;
             }
-        );
-        const result = data.customDomainCreate;
-        console.log(chalk.green(`[RAILWAY-API] ✓ Domain "${domain}" registered with Railway (ID: ${result.id})`));
+        }
+
+        let assigned = false;
+        try {
+            assigned = await assignDomainToNorthflank(domain);
+        } catch (e) {
+            console.error(chalk.yellow(`[NORTHFLANK-API] Domain "${domain}" was created but assignment to service port failed: ${e.message}`));
+        }
+
+        const resultDomain = created.domain || created.name || domain;
+        const result = {
+            ...created,
+            id: resultDomain,
+            domain: resultDomain,
+            assigned,
+        };
+        console.log(chalk.green(`[NORTHFLANK-API] ✓ Domain "${domain}" registered with Northflank${assigned ? ' and assigned' : ''} (ID: ${result.id})`));
         return result;
     } catch (e) {
-        console.error(chalk.red(`[RAILWAY-API] Failed to register "${domain}":`, e.message));
+        console.error(chalk.red(`[NORTHFLANK-API] Failed to register "${domain}":`, e.message));
         return null;
     }
 }
 
 /**
- * Unregister a custom domain from Railway.
- * @param {string} railwayDomainId - The Railway-assigned domain ID
+ * Unregister a custom domain from Northflank.
+ * @param {string} domainIdOrHostname - The Northflank domain identifier or hostname
  * @returns {Promise<boolean>} - true if successful
  */
-async function unregisterDomainFromRailway(railwayDomainId) {
-    if (!isRailwayApiConfigured() || !railwayDomainId) {
+async function unregisterDomainFromNorthflank(domainIdOrHostname) {
+    if (!isNorthflankApiConfigured() || !domainIdOrHostname) {
         return false;
     }
     try {
-        console.log(chalk.blue(`[RAILWAY-API] Removing domain ID "${railwayDomainId}" from Railway...`));
-        await railwayApiRequest(
-            `mutation($id: String!) { customDomainDelete(id: $id) }`,
-            { id: railwayDomainId }
-        );
-        console.log(chalk.green(`[RAILWAY-API] ✓ Domain removed from Railway.`));
+        console.log(chalk.blue(`[NORTHFLANK-API] Removing domain "${domainIdOrHostname}" from Northflank...`));
+        await northflankApiRequest('DELETE', `/v1/domains/${encodeURIComponent(domainIdOrHostname)}`);
+        console.log(chalk.green(`[NORTHFLANK-API] ✓ Domain removed from Northflank.`));
         return true;
     } catch (e) {
-        console.error(chalk.red(`[RAILWAY-API] Failed to remove domain:`, e.message));
+        if (e.statusCode === 404) {
+            console.log(chalk.yellow(`[NORTHFLANK-API] Domain "${domainIdOrHostname}" was already absent from Northflank.`));
+            return true;
+        }
+        console.error(chalk.red(`[NORTHFLANK-API] Failed to remove domain:`, e.message));
         return false;
     }
 }
@@ -650,7 +709,7 @@ async function getUserPreferredDomain(ownerId, reqHost) {
         }
 
         // No verified link domain and no LINK_DOMAIN configured — use the
-        // current request host (Railway hostname). This guarantees links
+        // current request host (Northflank hostname). This guarantees links
         // always resolve to a working server instead of a broken domain.
     } catch (e) {
         console.error('Error fetching custom domain:', e);
@@ -2276,35 +2335,35 @@ app.get('/api/domains', apiLimiter, authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Railway API status — lets the frontend know if auto-registration is available
-app.get('/api/railway-status', apiLimiter, authenticateToken, (req, res) => {
-    res.json({ configured: isRailwayApiConfigured() });
+// Northflank API status — lets the frontend know if auto-registration is available
+app.get('/api/northflank-status', apiLimiter, authenticateToken, (req, res) => {
+    res.json({ configured: isNorthflankApiConfigured() });
 });
 
-// Manual Railway registration — for domains that were added before RAILWAY_TOKEN was set,
+// Manual Northflank registration — for domains that were added before NORTHFLANK_API_TOKEN was set,
 // or when auto-registration failed and the user wants to retry.
-app.post('/api/domains/:id/railway-register', apiLimiter, authenticateToken, async (req, res) => {
+app.post('/api/domains/:id/northflank-register', apiLimiter, authenticateToken, async (req, res) => {
     try {
-        if (!isRailwayApiConfigured()) {
+        if (!isNorthflankApiConfigured()) {
             return res.status(400).json({
-                error: 'Railway API not configured. Set RAILWAY_TOKEN environment variable in your Railway service settings.',
+                error: 'Northflank API not configured. Set NORTHFLANK_API_TOKEN environment variable in your Northflank service settings.',
                 needsToken: true,
             });
         }
         const db = await getDb();
-        const domain = await db.get('SELECT id, hostname, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        const domain = await db.get('SELECT id, hostname, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
-        if (domain.railwayDomainId) {
-            return res.json({ success: true, alreadyRegistered: true, railwayDomainId: domain.railwayDomainId });
+        if (domain.northflankDomainId) {
+            return res.json({ success: true, alreadyRegistered: true, northflankDomainId: domain.northflankDomainId });
         }
 
-        const railwayResult = await registerDomainWithRailway(domain.hostname);
-        if (railwayResult && railwayResult.id) {
-            await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayResult.id, domain.id]);
-            res.json({ success: true, railwayDomainId: railwayResult.id });
+        const northflankResult = await registerDomainWithNorthflank(domain.hostname);
+        if (northflankResult && northflankResult.id) {
+            await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankResult.id, domain.id]);
+            res.json({ success: true, northflankDomainId: northflankResult.id });
         } else {
-            res.status(500).json({ error: 'Railway API call failed. Check server logs for details.' });
+            res.status(500).json({ error: 'Northflank API call failed. Check server logs for details.' });
         }
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2324,23 +2383,23 @@ app.post('/api/domains', apiLimiter, authenticateToken, async (req, res) => {
         // Refresh the domain gate caches so the new domain takes effect immediately
         await refreshAllDomainCaches();
 
-        // Auto-register with Railway if API credentials are configured
-        let railwayRegistered = false;
-        let railwayDomainId = null;
-        if (isRailwayApiConfigured()) {
-            const railwayResult = await registerDomainWithRailway(hostname);
-            if (railwayResult && railwayResult.id) {
-                railwayRegistered = true;
-                railwayDomainId = railwayResult.id;
-                await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayDomainId, result.lastID]);
+        // Auto-register with Northflank if API credentials are configured
+        let northflankRegistered = false;
+        let northflankDomainId = null;
+        if (isNorthflankApiConfigured()) {
+            const northflankResult = await registerDomainWithNorthflank(hostname);
+            if (northflankResult && northflankResult.id) {
+                northflankRegistered = true;
+                northflankDomainId = northflankResult.id;
+                await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankDomainId, result.lastID]);
             }
         }
 
         res.json({
             id: result.lastID, hostname, purpose, templateId: null,
             dnsVerified: 0, sslStatus: 'pending',
-            railwayRegistered,
-            railwayApiConfigured: isRailwayApiConfigured(),
+            northflankRegistered,
+            northflankApiConfigured: isNorthflankApiConfigured(),
         });
     } catch(e) { res.status(400).json({ error: 'Domain already exists' }); }
 });
@@ -2410,7 +2469,7 @@ function isCloudflareIp(ip) {
 }
 
 // Resolve the correct CNAME target — the hosting platform hostname, NOT a custom domain.
-// Custom domains must CNAME to the platform hostname (e.g., *.up.railway.app) to avoid
+// Custom domains must CNAME to the platform hostname (e.g., *.code.run) to avoid
 // Cloudflare Error 1000 caused by CNAMEing to another Cloudflare-proxied custom domain.
 function getCnameTarget(req) {
     // Priority 1: Explicit CNAME_TARGET env var — always trusted (user set it manually)
@@ -2418,30 +2477,30 @@ function getCnameTarget(req) {
         return config.cnameTarget;
     }
 
-    // Priority 2: RAILWAY_PUBLIC_DOMAIN, but ONLY if it looks like a platform hostname.
-    // Railway may set this to a custom domain (e.g., autismarmoset.com) which must NOT be
+    // Priority 2: NORTHFLANK_PUBLIC_DOMAIN, but ONLY if it looks like a platform hostname.
+    // Northflank may set this to a custom domain (e.g., autismarmoset.com) which must NOT be
     // used as a CNAME target — otherwise link domains would CNAME to the web domain,
     // causing Cloudflare Error 1000 and broken links.
-    if (config.railwayHostname && config.railwayHostname.endsWith('.railway.app')) {
-        return config.railwayHostname;
+    if (config.northflankHostname && config.northflankHostname.endsWith('.code.run')) {
+        return config.northflankHostname;
     }
 
-    // Priority 3: Request host if it's a Railway hostname (direct access via platform URL)
+    // Priority 3: Request host if it's a Northflank hostname (direct access via platform URL)
     const host = (req.get('host') || '').split(':')[0]; // Strip port
-    if (host.endsWith('.railway.app')) {
+    if (host.endsWith('.code.run')) {
         return host;
     }
 
     // Fallback: generic placeholder — user must set CNAME_TARGET env var
-    return 'your-app.up.railway.app';
+    return 'your-service.code.run';
 }
 
 app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req, res) => {
     try {
         const db = await getDb();
-        // Include purpose (link vs web) and railwayDomainId for purpose-aware checks
-        // and to avoid re-registering domains that already have a Railway domain ID.
-        const domain = await db.get('SELECT id, hostname, purpose, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        // Include purpose (link vs web) and northflankDomainId for purpose-aware checks
+        // and to avoid re-registering domains that already have a Northflank domain ID.
+        const domain = await db.get('SELECT id, hostname, purpose, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
         const dnsP = dns.promises;
@@ -2467,7 +2526,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
         // --- Cloudflare proxy-aware DNS verification ---
         // When Cloudflare proxy (orange cloud) is ON, resolveCname() returns nothing
         // and resolve4() returns Cloudflare proxy IPs. This is the CORRECT setup for
-        // domains whose origin (e.g. Railway) also uses Cloudflare infrastructure.
+        // domains whose origin (e.g. Northflank) also uses Cloudflare infrastructure.
         // We must NOT treat Cloudflare proxy IPs as an Error 1000 conflict.
 
         const hasCname = results.cname && results.cname.length > 0;
@@ -2477,7 +2536,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 
         if (hasCname) {
             // CNAME exists — DNS is verified. The A records (which follow the CNAME
-            // chain) will naturally resolve to Cloudflare IPs when the origin (Railway)
+            // chain) will naturally resolve to Cloudflare IPs when the origin (Northflank)
             // uses Cloudflare. This is expected, not a conflict.
             results.dnsVerified = true;
         } else if (hasCfIps) {
@@ -2518,11 +2577,11 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                                 const lower = body.toLowerCase();
                                 if (lower.includes('error 1000') || lower.includes('dns points to prohibited') || lower.includes('cname cross-user')) {
                                     resolve('error_1000');
-                                } else if (RAILWAY_NOT_FOUND_MARKERS.some(marker => lower.includes(marker))) {
-                                    // Railway's own "Not Found" page — the domain is NOT registered
-                                    // as a custom domain in the Railway service settings. Traffic
-                                    // reaches Railway via Cloudflare proxy but Railway rejects it.
-                                    resolve('railway_not_registered');
+                                } else if ((probeRes.statusCode === 404 || probeRes.statusCode === 503 || lower.includes('northflank')) && NORTHFLANK_NOT_FOUND_MARKERS.some(marker => lower.includes(marker))) {
+                                    // Northflank's own "Not Found" page — the domain is NOT registered
+                                    // as a custom domain in the Northflank Ports & DNS settings. Traffic
+                                    // reaches Northflank via Cloudflare proxy but Northflank rejects it.
+                                    resolve('northflank_not_registered');
                                 } else {
                                     resolve('cf_proxy_active');
                                 }
@@ -2542,25 +2601,25 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                 // still be unreachable, e.g. 522/521, but the CNAME+proxy setup is correct).
                 results.dnsVerified = true;
                 results.cloudflareProxied = true;
-            } else if (probeResult === 'railway_not_registered') {
-                // Cloudflare proxy is working but Railway returned its "Not Found" page.
-                // This means the domain is NOT added as a custom domain in Railway's
-                // service settings. Traffic reaches Railway but gets rejected.
+            } else if (probeResult === 'northflank_not_registered') {
+                // Cloudflare proxy is working but Northflank returned its "Not Found" page.
+                // This means the domain is NOT added as a custom domain in Northflank's
+                // Ports & DNS settings. Traffic reaches Northflank but gets rejected.
                 results.cloudflareProxied = true;
-                results.railwayNotRegistered = true;
-                results.railwayApiConfigured = isRailwayApiConfigured();
+                results.northflankNotRegistered = true;
+                results.northflankApiConfigured = isNorthflankApiConfigured();
 
-                // Attempt auto-registration with Railway if API is configured
-                if (isRailwayApiConfigured()) {
-                    const railwayResult = await registerDomainWithRailway(hostname);
-                    if (railwayResult && railwayResult.id) {
-                        await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayResult.id, domain.id]);
-                        results.railwayAutoRegistered = true;
-                        results.railwayNotRegistered = false;
-                        results.dnsVerified = false; // Will be verified when user runs DNS check after Railway provisions routing
+                // Attempt auto-registration with Northflank if API is configured
+                if (isNorthflankApiConfigured()) {
+                    const northflankResult = await registerDomainWithNorthflank(hostname);
+                    if (northflankResult && northflankResult.id) {
+                        await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankResult.id, domain.id]);
+                        results.northflankAutoRegistered = true;
+                        results.northflankNotRegistered = false;
+                        results.dnsVerified = false; // Will be verified when user runs DNS check after Northflank provisions routing
                         results.instructions.push(
-                            `✅ Domain "${hostname}" has been automatically registered with Railway!`,
-                            'Railway is now provisioning routing for this domain. This typically takes 1-2 minutes.',
+                            `✅ Domain "${hostname}" has been automatically registered with Northflank!`,
+                            'Northflank is now provisioning routing for this domain. This typically takes 1-2 minutes.',
                             'Click "Check DNS" again in a minute or two to verify the domain is fully active.'
                         );
                         await db.run(
@@ -2574,44 +2633,44 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 
                 // Auto-registration not available or failed — show manual instructions
                 results.dnsVerified = false;
-                if (isRailwayApiConfigured()) {
+                if (isNorthflankApiConfigured()) {
                     results.instructions.push(
-                        `⚠️ DOMAIN NOT REGISTERED WITH RAILWAY: Cloudflare proxy is routing traffic correctly, but Railway returned "Not Found" for "${hostname}".`,
-                        'Auto-registration with Railway failed. You can:',
+                        `⚠️ DOMAIN NOT REGISTERED WITH NORTHFLANK: Cloudflare proxy is routing traffic correctly, but Northflank returned "Not Found" for "${hostname}".`,
+                        'Auto-registration with Northflank failed. You can:',
                         '',
-                        '🔧 Option 1: Click the "Register with Railway" button below to retry.',
+                        '🔧 Option 1: Click the "Register with Northflank" button below to retry.',
                         '',
                         '🔧 Option 2: Register manually:',
-                        '1. Go to your Railway project dashboard → select your service → Settings → Networking → Custom Domain.',
-                        `2. Add "${hostname}" as a custom domain in Railway.`,
+                        '1. Go to your Northflank project dashboard → select your service → Ports & DNS → link domain.',
+                        `2. Add "${hostname}" as a custom domain in Northflank.`,
                         '3. After adding, come back here and click "Check DNS" again.'
                     );
                 } else {
                     results.instructions.push(
-                        `⚠️ DOMAIN NOT REGISTERED WITH RAILWAY: Cloudflare proxy is routing traffic correctly, but Railway returned "Not Found" for "${hostname}".`,
-                        'This means the domain is not added as a custom domain in your Railway service.',
+                        `⚠️ DOMAIN NOT REGISTERED WITH NORTHFLANK: Cloudflare proxy is routing traffic correctly, but Northflank returned "Not Found" for "${hostname}".`,
+                        'This means the domain is not added as a custom domain in your Northflank service.',
                         '',
                         '🔧 RECOMMENDED FIX — Set up automatic registration:',
-                        '1. Go to Railway dashboard → Account Settings → Tokens → Create Token.',
-                        '2. Add the token as RAILWAY_TOKEN in your Railway service environment variables.',
+                        '1. Go to Northflank dashboard → Account Settings → API Tokens → Create team token.',
+                        '2. Add the token as NORTHFLANK_API_TOKEN in your Northflank service environment variables.',
                         '3. Redeploy the service, then click "Check DNS" again — the domain will be registered automatically.',
                         '',
                         '🔧 ALTERNATIVE — Register manually:',
-                        '1. Go to your Railway project dashboard → select your service → Settings → Networking → Custom Domain.',
-                        `2. Add "${hostname}" as a custom domain in Railway.`,
+                        '1. Go to your Northflank project dashboard → select your service → Ports & DNS → link domain.',
+                        `2. Add "${hostname}" as a custom domain in Northflank.`,
                         '3. After adding, come back here and click "Check DNS" again.',
                         '',
-                        'Note: Custom domains must be added to BOTH Railway AND this dashboard to work properly.',
-                        'Railway handles routing, while this dashboard manages domain purpose (link vs web).'
+                        'Note: Custom domains must be added to BOTH Northflank AND this dashboard to work properly.',
+                        'Northflank handles routing, while this dashboard manages domain purpose (link vs web).'
                     );
                 }
 
                 await db.run(
                     'UPDATE custom_domains SET dnsVerified = 0, sslStatus = ? WHERE id = ?',
-                    ['railway_not_registered', domain.id]
+                    ['northflank_not_registered', domain.id]
                 );
 
-                results.sslStatus = 'railway_not_registered';
+                results.sslStatus = 'northflank_not_registered';
                 return res.json(results);
             } else if (probeResult === 'error_1000') {
                 // Confirmed Cloudflare Error 1000 — A record pointing to a prohibited IP
@@ -2655,7 +2714,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
         if (results.dnsVerified) {
             if (results.cloudflareProxied) {
                 // Cloudflare proxy is active — Cloudflare handles SSL at the edge.
-                // The origin cert (Railway's *.up.railway.app) won't match the custom domain,
+                // The origin cert (Northflank's *.code.run) won't match the custom domain,
                 // but that's expected and correct. End users always get a valid Cloudflare
                 // edge certificate for the proxied domain. Skip the cert identity check.
                 sslStatus = 'active';
@@ -2668,7 +2727,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                         // We connect without strict validation to check HTTPS availability, then
                         // inspect the certificate to see if it actually matches the hostname.
                         // This distinguishes "SSL active" from "HTTPS reachable but cert is wrong"
-                        // (e.g., Railway's *.up.railway.app cert served for a custom domain).
+                        // (e.g., Northflank's *.code.run cert served for a custom domain).
                         const sslReq = https.get(`https://${hostname}`, { timeout: 5000, rejectUnauthorized: false }, (sslRes) => {
                             sslRes.resume(); // Drain response to prevent memory leak
                             // Check if the certificate matches the hostname
@@ -2684,7 +2743,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                                         results.certMatch = true;
                                     } else {
                                         // HTTPS is reachable but certificate is for a different domain
-                                        // (e.g., *.up.railway.app instead of the custom domain)
+                                        // (e.g., *.code.run instead of the custom domain)
                                         results.sslReady = false;
                                         sslStatus = 'cert_mismatch';
                                         results.certMatch = false;
@@ -2750,12 +2809,12 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                 '   When proxy is ON, Cloudflare provides a valid SSL certificate for your domain automatically.',
                 '3. Set SSL/TLS mode to "Full" (NOT "Full (Strict)") in Cloudflare SSL/TLS settings.',
                 '   "Full (Strict)" requires the origin server to have a certificate matching your domain,',
-                '   but Railway\'s default certificate covers *.up.railway.app only.',
+                '   but Northflank\'s default certificate covers *.code.run only.',
                 '4. After enabling the proxy, wait 1-2 minutes and run this DNS check again.',
                 '',
                 '🔧 FIX — If you are NOT using Cloudflare:',
-                '1. Add this custom domain directly in your Railway service settings → Custom Domains.',
-                '   Railway will provision a valid SSL certificate for it automatically.',
+                '1. Add this custom domain directly in your Northflank service → Ports & DNS.',
+                '   Northflank will provision a valid SSL certificate for it automatically.',
                 '2. Alternatively, use Cloudflare as your DNS provider with proxy enabled (recommended).'
             );
         } else if (results.cloudflareProxied && results.sslReady) {
@@ -2790,13 +2849,13 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 app.delete('/api/domains/:id', apiLimiter, authenticateToken, async (req, res) => {
     try {
         const db = await getDb();
-        // Fetch the domain first to get the Railway domain ID for cleanup
-        const domain = await db.get('SELECT id, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        // Fetch the domain first to get the Northflank domain ID for cleanup
+        const domain = await db.get('SELECT id, hostname, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
-        // Auto-unregister from Railway if we have a Railway domain ID
-        if (domain.railwayDomainId) {
-            await unregisterDomainFromRailway(domain.railwayDomainId);
+        // Auto-unregister from Northflank if we have a Northflank domain ID
+        if (domain.northflankDomainId) {
+            await unregisterDomainFromNorthflank(domain.northflankDomainId || domain.hostname);
         }
 
         await db.run('DELETE FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);

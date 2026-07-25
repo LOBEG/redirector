@@ -325,9 +325,19 @@ NODE_ENV=production
 # Optional: Dedicated link domain (separates tracking URLs from dashboard)
 LINK_DOMAIN=links.yourdomain.com
 
-# Optional: Railway.app hostname (for CNAME target in custom domain setup)
-# Automatically set by Railway via RAILWAY_PUBLIC_DOMAIN
-RAILWAY_PUBLIC_DOMAIN=your-app.up.railway.app
+# Optional: Northflank public hostname (for CNAME target in custom domain setup)
+# Set this to your service's .code.run hostname, or set CNAME_TARGET explicitly.
+NORTHFLANK_PUBLIC_DOMAIN=your-service.code.run
+
+# Optional: Explicit platform CNAME target for custom domains
+CNAME_TARGET=your-service.code.run
+
+# Optional: Northflank API auto-registration for custom domains
+NORTHFLANK_API_TOKEN=your-team-api-token
+NORTHFLANK_PROJECT_ID=your-project-id
+NORTHFLANK_SERVICE_ID=your-service-id
+NORTHFLANK_PORT_NAME=p01
+NORTHFLANK_VOLUME_MOUNT_PATH=/data
 
 # Optional: Redis cache
 REDIS_URL=redis://localhost:6379
@@ -414,6 +424,8 @@ All API endpoints (except auth and health) require a JWT token in the `Authoriza
 | PATCH | `/api/domains/:id` | Assign a template to a domain |
 | DELETE | `/api/domains/:id` | Remove a custom domain |
 | GET | `/api/domains/:id/dns-check` | Check DNS & SSL status |
+| GET | `/api/northflank-status` | Check if Northflank auto-registration is configured |
+| POST | `/api/domains/:id/northflank-register` | Retry Northflank domain registration |
 
 ### Short Links
 
@@ -497,10 +509,15 @@ You can add custom domains for link generation and tracking. Each domain can hav
 
 ### Setup
 
-1. Add your domain via the API or dashboard.
-2. Create a CNAME record pointing to your Railway hostname (shown in DNS check).
-3. If using Cloudflare: enable proxy (orange cloud), set SSL to "Full" or "Full (Strict)".
-4. Run the DNS check endpoint to verify.
+1. Deploy the service on Northflank from this repository using a Node/buildpack service. Keep the start command as `npm start`, expose port `p01`, and set the HTTP health check path to `/health`.
+2. Set `NORTHFLANK_PUBLIC_DOMAIN` to the service `.code.run` hostname, or set `CNAME_TARGET` explicitly.
+3. Add your custom domain via the dashboard or API.
+4. In Northflank, go to Project → Service → Ports & DNS and link the verified domain/subdomain to the service port.
+5. Create a CNAME record pointing to your Northflank `.code.run` hostname (shown in DNS check).
+6. If using Cloudflare: enable proxy (orange cloud), set SSL to "Full" or "Full (Strict)".
+7. Run the DNS check endpoint to verify.
+
+`northflank.json` is included as a template for Northflank's Infrastructure as Code import. Replace its placeholder `vcsData.projectUrl`, project id, branch, and billing plan with your real Northflank/GitHub values. If your workspace requires different template fields, mirror the dashboard setup above and keep the service command as `npm start`.
 
 ---
 

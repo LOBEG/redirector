@@ -301,8 +301,8 @@ const app = {
                 if (e.target.closest('button.dns-check-btn')) {
                     this.checkDomainDns(e.target.closest('button.dns-check-btn').dataset.id);
                 }
-                if (e.target.closest('button.railway-register-btn')) {
-                    this.registerDomainWithRailway(e.target.closest('button.railway-register-btn').dataset.id);
+                if (e.target.closest('button.northflank-register-btn')) {
+                    this.registerDomainWithNorthflank(e.target.closest('button.northflank-register-btn').dataset.id);
                 }
             });
             this.ui.domainsTbody.addEventListener('change', (e) => {
@@ -551,12 +551,12 @@ const app = {
             // Only use the server-provided target; never fall back to window.location.host
             // because the user may be accessing via a custom domain, which must NOT be used
             // as a CNAME target (causes Cloudflare Error 1000).
-            const cnameTarget = cnameData.cnameTarget || 'your-app.up.railway.app';
+            const cnameTarget = cnameData.cnameTarget || 'your-service.code.run';
             if (this.ui.cnameTarget) this.ui.cnameTarget.textContent = cnameTarget;
             if (this.ui.cnameTargetDomains) this.ui.cnameTargetDomains.textContent = cnameTarget;
         } catch (e) {
             // Use placeholder instead of window.location.host to avoid showing a custom domain
-            const fallback = 'your-app.up.railway.app';
+            const fallback = 'your-service.code.run';
             if (this.ui.cnameTarget) this.ui.cnameTarget.textContent = fallback;
             if (this.ui.cnameTargetDomains) this.ui.cnameTargetDomains.textContent = fallback;
         }
@@ -817,7 +817,7 @@ const app = {
         if (!hostname) return;
         // Hostname format validation — must be a fully-qualified domain (at least two labels).
         // Mirrors the server-side regex in POST /api/domains; single-label hostnames like
-        // "localhost" are intentionally rejected because Railway / Cloudflare custom domains
+        // "localhost" are intentionally rejected because Northflank / Cloudflare custom domains
         // always require an FQDN.
         const hostnameRegex = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
         if (!hostnameRegex.test(hostname)) {
@@ -833,12 +833,12 @@ const app = {
             this.domains.push(newDomain);
             this.renderDomains();
             const purposeLabel = purpose === 'link' ? 'Link' : 'Web';
-            if (newDomain.railwayRegistered) {
-                this.showToast('success', 'Domain Added & Registered', `${hostname} has been added as a ${purposeLabel} domain and automatically registered with Railway. Run a DNS check after 1-2 minutes to verify.`);
-            } else if (newDomain.railwayApiConfigured === false) {
-                this.showToast('warning', 'Domain Added — Railway Setup Needed', `${hostname} added as a ${purposeLabel} domain. To make it work, set RAILWAY_TOKEN in your Railway environment variables for automatic registration, or add the domain manually in Railway's Custom Domain settings.`);
+            if (newDomain.northflankRegistered) {
+                this.showToast('success', 'Domain Added & Registered', `${hostname} has been added as a ${purposeLabel} domain and automatically registered with Northflank. Run a DNS check after 1-2 minutes to verify.`);
+            } else if (newDomain.northflankApiConfigured === false) {
+                this.showToast('warning', 'Domain Added — Northflank Setup Needed', `${hostname} added as a ${purposeLabel} domain. To make it work, set NORTHFLANK_API_TOKEN in your Northflank environment variables for automatic registration, or add the domain manually in Northflank's Ports & DNS settings.`);
             } else {
-                this.showToast('warning', 'Domain Added — Registration Failed', `${hostname} added as a ${purposeLabel} domain, but Railway auto-registration failed. Add the domain manually in Railway's Custom Domain settings, or click "Check DNS" to retry.`);
+                this.showToast('warning', 'Domain Added — Registration Failed', `${hostname} added as a ${purposeLabel} domain, but Northflank auto-registration failed. Add the domain manually in Northflank's Ports & DNS settings, or click "Check DNS" to retry.`);
             }
         } catch (err) {
             this.ui.domainError.textContent = err.message;
@@ -911,13 +911,13 @@ const app = {
             this.showDnsCheckResult(result);
             if (result.cloudflareConflict) {
                 this.showToast('error', 'Cloudflare Error 1000', `${result.hostname}: DNS resolves to a Cloudflare IP with an A record pointing to a prohibited IP. See instructions panel below.`);
-            } else if (result.railwayAutoRegistered) {
-                this.showToast('success', 'Auto-Registered with Railway', `${result.hostname}: Domain was automatically registered with Railway! Wait 1-2 minutes for Railway to provision routing, then check DNS again.`);
-            } else if (result.railwayNotRegistered) {
-                if (result.railwayApiConfigured) {
-                    this.showToast('error', 'Railway Registration Failed', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. See instructions panel below.`);
+            } else if (result.northflankAutoRegistered) {
+                this.showToast('success', 'Auto-Registered with Northflank', `${result.hostname}: Domain was automatically registered with Northflank! Wait 1-2 minutes for Northflank to provision routing, then check DNS again.`);
+            } else if (result.northflankNotRegistered) {
+                if (result.northflankApiConfigured) {
+                    this.showToast('error', 'Northflank Registration Failed', `${result.hostname}: Cloudflare proxy is working but Northflank does not recognize this domain. See instructions panel below.`);
                 } else {
-                    this.showToast('error', 'Domain Not Registered with Railway', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. See instructions panel below.`);
+                    this.showToast('error', 'Domain Not Registered with Northflank', `${result.hostname}: Cloudflare proxy is working but Northflank does not recognize this domain. See instructions panel below.`);
                 }
             } else if (result.cfPending) {
                 this.showToast('warning', 'Cloudflare Propagating', `${result.hostname}: DNS resolves to Cloudflare IPs but HTTPS is not yet reachable. If you just set up the CNAME, wait 2-5 minutes and check again.`);
@@ -1040,23 +1040,24 @@ const app = {
             `${successCount}/${this.domains.length} domain(s) verified.`
         );
     },
-
-    async registerDomainWithRailway(domainId) {
+
+
+    async registerDomainWithNorthflank(domainId) {
         try {
-            this.showToast('info', 'Railway Registration', 'Registering domain with Railway...');
-            const result = await this.handleApiCall(`/api/domains/${domainId}/railway-register`, { method: 'POST' });
+            this.showToast('info', 'Northflank Registration', 'Registering domain with Northflank...');
+            const result = await this.handleApiCall(`/api/domains/${domainId}/northflank-register`, { method: 'POST' });
             if (result.needsToken) {
-                this.showToast('error', 'Railway Token Required', 'Set RAILWAY_TOKEN in your Railway environment variables. Go to Railway dashboard → Account → Tokens to generate one.');
+                this.showToast('error', 'Northflank Token Required', 'Set NORTHFLANK_API_TOKEN in your Northflank environment variables. Go to Northflank dashboard → Account Settings → API Tokens to generate one.');
             } else if (result.alreadyRegistered) {
-                this.showToast('info', 'Already Registered', 'This domain is already registered with Railway. Run DNS check to verify status.');
+                this.showToast('info', 'Already Registered', 'This domain is already registered with Northflank. Run DNS check to verify status.');
             } else if (result.success) {
-                this.showToast('success', 'Registered with Railway', 'Domain registered successfully! Wait 1-2 minutes for Railway to provision routing, then check DNS again.');
+                this.showToast('success', 'Registered with Northflank', 'Domain registered successfully! Wait 1-2 minutes for Northflank to provision routing, then check DNS again.');
                 const domain = this.domains.find(d => d.id === parseInt(domainId));
                 if (domain) { domain.sslStatus = 'provisioning'; }
                 this.renderDomains();
             }
         } catch (err) {
-            this.showToast('error', 'Railway Registration Failed', err.message);
+            this.showToast('error', 'Northflank Registration Failed', err.message);
         }
     },
 
@@ -1564,10 +1565,10 @@ const app = {
         this.domains.forEach(domain => {
             const purposeLabel = domain.purpose === 'web' ? 'Web' : 'Link';
             const purposeBadge = domain.purpose === 'web' ? 'badge-info' : 'badge-warning';
-            const dnsBadge = domain.dnsVerified ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'railway_not_registered' ? 'badge-error' : 'badge-warning');
-            const dnsLabel = domain.dnsVerified ? '✓ Verified' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ CF Error' : (domain.sslStatus === 'railway_not_registered' ? '⚠️ Not in Railway' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : 'Unverified')));
-            const sslBadge = domain.sslStatus === 'active' ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'railway_not_registered' ? 'badge-error' : (domain.sslStatus === 'cert_mismatch' ? 'badge-error' : 'badge-warning'));
-            const sslLabel = domain.sslStatus === 'active' ? '✓ Active' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ Fix DNS' : (domain.sslStatus === 'railway_not_registered' ? '⚠️ Add to Railway' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : (domain.sslStatus === 'cert_mismatch' ? '⚠️ Cert Mismatch' : 'Pending'))));
+            const dnsBadge = domain.dnsVerified ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'northflank_not_registered' ? 'badge-error' : 'badge-warning');
+            const dnsLabel = domain.dnsVerified ? '✓ Verified' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ CF Error' : (domain.sslStatus === 'northflank_not_registered' ? '⚠️ Not in Northflank' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : 'Unverified')));
+            const sslBadge = domain.sslStatus === 'active' ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'northflank_not_registered' ? 'badge-error' : (domain.sslStatus === 'cert_mismatch' ? 'badge-error' : 'badge-warning'));
+            const sslLabel = domain.sslStatus === 'active' ? '✓ Active' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ Fix DNS' : (domain.sslStatus === 'northflank_not_registered' ? '⚠️ Add to Northflank' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : (domain.sslStatus === 'cert_mismatch' ? '⚠️ Cert Mismatch' : 'Pending'))));
             // Build template options for domain-level assignment
             let templateOptions = '<option value="">System Default</option>';
             if (this.templates && this.templates.length > 0) {
@@ -1576,8 +1577,8 @@ const app = {
                     templateOptions += `<option value="${t.id}" ${selected}>${t.name}</option>`;
                 });
             }
-            const railwayBtn = domain.sslStatus === 'railway_not_registered'
-                ? `<button class="action-btn railway-register-btn" data-id="${domain.id}" title="Register with Railway" style="margin-right:4px;font-size:0.7rem;padding:2px 6px;background:#7c3aed;border-radius:4px;color:#fff;">🚂 Register</button>`
+            const northflankBtn = domain.sslStatus === 'northflank_not_registered'
+                ? `<button class="action-btn northflank-register-btn" data-id="${domain.id}" title="Register with Northflank" style="margin-right:4px;font-size:0.7rem;padding:2px 6px;background:#7c3aed;border-radius:4px;color:#fff;">🔗 Register</button>`
                 : '';
             const tr = document.createElement('tr');
             tr.innerHTML = `
@@ -1598,7 +1599,7 @@ const app = {
                 </td>
                 <td data-label="SSL"><span class="badge ${sslBadge}">${sslLabel}</span></td>
                 <td data-label="Actions" class="text-right">
-                    ${railwayBtn}<button class="action-btn delete-btn" data-id="${domain.id}" title="Delete">
+                    ${northflankBtn}<button class="action-btn delete-btn" data-id="${domain.id}" title="Delete">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                     </button>
                 </td>

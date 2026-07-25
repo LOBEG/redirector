@@ -2,7 +2,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 
 // Robust Fallback: Generate a random secret if missing.
-// In Production, warn heavily but still start — this allows Railway healthchecks
+// In Production, warn heavily but still start — this allows platform healthchecks
 // to pass while the user configures env vars. Sessions won't persist across restarts.
 const DEFAULT_SECRET = crypto.randomBytes(32).toString('hex');
 const isProduction = process.env.NODE_ENV === 'production';
@@ -15,7 +15,7 @@ if (!process.env.REDIRECTOR_SECRET) {
   log('[CONFIG] WARNING: REDIRECTOR_SECRET not set — using random fallback.');
 }
 if (isProduction && (!process.env.JWT_SECRET || !process.env.REDIRECTOR_SECRET)) {
-  log('[CONFIG] Set JWT_SECRET and REDIRECTOR_SECRET in your Railway environment variables for production use.');
+  log('[CONFIG] Set JWT_SECRET and REDIRECTOR_SECRET in your Northflank environment variables for production use.');
 }
 if (!process.env.ADMIN_EMAIL) {
   console.warn('[CONFIG] WARNING: ADMIN_EMAIL not set — using default admin@proctektexas.org.');
@@ -32,19 +32,20 @@ module.exports = {
   // Link Domain — dedicated domain used exclusively for generated tracking links.
   linkDomain: process.env.LINK_DOMAIN || '',
 
-  // Railway hostname — auto-set by Railway via RAILWAY_PUBLIC_DOMAIN (may be custom domain or .railway.app).
-  railwayHostname: process.env.RAILWAY_PUBLIC_DOMAIN || '',
+  // Northflank hostname — set manually to your Northflank public hostname (usually *.code.run).
+  northflankHostname: process.env.NORTHFLANK_PUBLIC_DOMAIN || '',
 
-  // Explicit CNAME target — set this to your platform hostname (e.g., your-app.up.railway.app)
-  // when RAILWAY_PUBLIC_DOMAIN is a custom domain. This is the hostname users should CNAME to.
+  // Explicit CNAME target — set this to your platform hostname (e.g., your-service.code.run)
+  // when NORTHFLANK_PUBLIC_DOMAIN is a custom domain. This is the hostname users should CNAME to.
   cnameTarget: process.env.CNAME_TARGET || '',
 
-  // Railway API — for automatic custom domain registration.
-  // RAILWAY_TOKEN must be generated in Railway dashboard (Account → Tokens) and set manually.
-  // RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID are auto-injected by Railway at runtime.
-  railwayToken: process.env.RAILWAY_TOKEN || '',
-  railwayServiceId: process.env.RAILWAY_SERVICE_ID || '',
-  railwayEnvironmentId: process.env.RAILWAY_ENVIRONMENT_ID || '',
+  // Northflank API — for automatic custom domain registration.
+  // NORTHFLANK_API_TOKEN must be generated in Northflank and set manually.
+  // Project/service identifiers must also be configured manually.
+  northflankApiToken: process.env.NORTHFLANK_API_TOKEN || '',
+  northflankProjectId: process.env.NORTHFLANK_PROJECT_ID || '',
+  northflankServiceId: process.env.NORTHFLANK_SERVICE_ID || '',
+  northflankPortName: process.env.NORTHFLANK_PORT_NAME || 'p01',
   
   // JWT Authentication
   jwt: {
