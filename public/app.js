@@ -44,6 +44,7 @@ const app = {
             addDestinationBtn: document.getElementById('add-destination-btn'),
             licenseKeyInput: document.getElementById('license-key-input'),
             expiresAtInput: document.getElementById('expires-at-input'),
+            singleUseInput: document.getElementById('single-use-input'),
             customDomainSelect: document.getElementById('custom-domain-select'),
             linkTemplateSelect: document.getElementById('link-template-select'),
             createError: document.getElementById('create-error'),
@@ -63,6 +64,13 @@ const app = {
             noDomainsMessage: document.getElementById('no-domains'),
             cnameTarget: document.getElementById('cname-target'),
             cnameTargetDomains: document.getElementById('cname-target-domains'),
+            copyCnameTargetBtn: document.getElementById('copy-cname-target-btn'),
+            checkAllDnsBtn: document.getElementById('check-all-dns-btn'),
+            dnsCheckPanel: document.getElementById('dns-check-panel'),
+            dnsCheckTitle: document.getElementById('dns-check-title'),
+            dnsCheckSummary: document.getElementById('dns-check-summary'),
+            dnsCheckInstructions: document.getElementById('dns-check-instructions'),
+            dnsCheckCloseBtn: document.getElementById('dns-check-close-btn'),
             createShortLinkForm: document.getElementById('create-short-link-form'),
             shortLinkUrl: document.getElementById('short-link-url'),
             shortLinkAlias: document.getElementById('short-link-alias'),
@@ -111,6 +119,9 @@ const app = {
             adminNavItem: document.getElementById('admin-nav-item'),
             generateKeyForm: document.getElementById('generate-key-form'),
             targetEmail: document.getElementById('target-email'),
+            keyExpiryPreset: document.getElementById('key-expiry-preset'),
+            keyExpiryCustomWrapper: document.getElementById('key-expiry-custom-wrapper'),
+            keyExpiryDays: document.getElementById('key-expiry-days'),
             generateKeyError: document.getElementById('generate-key-error'),
             generatedKeyResult: document.getElementById('generated-key-result'),
             generatedKeyValue: document.getElementById('generated-key-value'),
@@ -214,6 +225,10 @@ const app = {
         if (this.ui.clearFeedBtn) {
             this.ui.clearFeedBtn.addEventListener('click', () => this.clearFeed());
         }
+        const refreshBotBtn = document.getElementById('refresh-bot-feed-btn');
+        if (refreshBotBtn) refreshBotBtn.addEventListener('click', () => this.refreshBotFeed());
+        const refreshHumanBtn = document.getElementById('refresh-human-feed-btn');
+        if (refreshHumanBtn) refreshHumanBtn.addEventListener('click', () => this.refreshHumanFeed());
         if (this.ui.analyticsModal) {
             this.ui.analyticsModal.addEventListener('click', (e) => {
                 if (e.target === this.ui.analyticsModal) this.closeAnalyticsModal();
@@ -286,8 +301,8 @@ const app = {
                 if (e.target.closest('button.dns-check-btn')) {
                     this.checkDomainDns(e.target.closest('button.dns-check-btn').dataset.id);
                 }
-                if (e.target.closest('button.railway-register-btn')) {
-                    this.registerDomainWithRailway(e.target.closest('button.railway-register-btn').dataset.id);
+                if (e.target.closest('button.northflank-register-btn')) {
+                    this.registerDomainWithNorthflank(e.target.closest('button.northflank-register-btn').dataset.id);
                 }
             });
             this.ui.domainsTbody.addEventListener('change', (e) => {
@@ -303,6 +318,28 @@ const app = {
                 }
             });
         }
+        // DNS enhancement: Copy CNAME target button
+        if (this.ui.copyCnameTargetBtn) {
+            this.ui.copyCnameTargetBtn.addEventListener('click', () => {
+                const target = (this.ui.cnameTargetDomains && this.ui.cnameTargetDomains.textContent || '').trim();
+                if (target && target !== 'loading...') {
+                    this.copyToClipboard(target);
+                    this.showToast('success', 'Copied!', `CNAME target "${target}" copied to clipboard.`);
+                } else {
+                    this.showToast('warning', 'Not Ready', 'CNAME target is still loading.');
+                }
+            });
+        }
+        // DNS enhancement: Check All Domains button
+        if (this.ui.checkAllDnsBtn) {
+            this.ui.checkAllDnsBtn.addEventListener('click', () => this.checkAllDomainsDns());
+        }
+        // DNS enhancement: Close DNS result panel
+        if (this.ui.dnsCheckCloseBtn) {
+            this.ui.dnsCheckCloseBtn.addEventListener('click', () => {
+                if (this.ui.dnsCheckPanel) this.ui.dnsCheckPanel.hidden = true;
+            });
+        }
         if (this.ui.shortLinksTbody) {
             this.ui.shortLinksTbody.addEventListener('click', (e) => {
                 const button = e.target.closest('button.action-btn');
@@ -312,6 +349,7 @@ const app = {
                 if (button.classList.contains('copy-btn')) this.copyToClipboard(url);
                 else if (button.classList.contains('delete-btn')) this.deleteShortLink(slug);
                 else if (button.classList.contains('analytics-btn')) this.showShortLinkAnalytics(slug);
+                else if (button.classList.contains('qr-btn')) window.open(`/api/short-links/${encodeURIComponent(slug)}/qr.svg`, '_blank');
             });
         }
         if (this.ui.templatesTbody) {
@@ -344,6 +382,22 @@ const app = {
         });
         if (this.ui.generateKeyForm) {
             this.ui.generateKeyForm.addEventListener('submit', (e) => { e.preventDefault(); this.generateKey(); });
+        }
+        // Toggle the custom-days input based on the preset selection. Showing a
+        // dedicated number input only when "Custom…" is picked keeps the form
+        // lightweight while still supporting any value in [1, 3650].
+        if (this.ui.keyExpiryPreset) {
+            const updateCustomVisibility = () => {
+                const isCustom = this.ui.keyExpiryPreset.value === 'custom';
+                if (this.ui.keyExpiryCustomWrapper) {
+                    this.ui.keyExpiryCustomWrapper.hidden = !isCustom;
+                }
+                if (this.ui.keyExpiryDays) {
+                    this.ui.keyExpiryDays.required = isCustom;
+                }
+            };
+            this.ui.keyExpiryPreset.addEventListener('change', updateCustomVisibility);
+            updateCustomVisibility();
         }
         if (this.ui.copyGeneratedKey) {
             this.ui.copyGeneratedKey.addEventListener('click', () => this.copyToClipboard(this.ui.generatedKeyValue.value));
@@ -497,12 +551,12 @@ const app = {
             // Only use the server-provided target; never fall back to window.location.host
             // because the user may be accessing via a custom domain, which must NOT be used
             // as a CNAME target (causes Cloudflare Error 1000).
-            const cnameTarget = cnameData.cnameTarget || 'your-app.up.railway.app';
+            const cnameTarget = cnameData.cnameTarget || 'your-service.code.run';
             if (this.ui.cnameTarget) this.ui.cnameTarget.textContent = cnameTarget;
             if (this.ui.cnameTargetDomains) this.ui.cnameTargetDomains.textContent = cnameTarget;
         } catch (e) {
             // Use placeholder instead of window.location.host to avoid showing a custom domain
-            const fallback = 'your-app.up.railway.app';
+            const fallback = 'your-service.code.run';
             if (this.ui.cnameTarget) this.ui.cnameTarget.textContent = fallback;
             if (this.ui.cnameTargetDomains) this.ui.cnameTargetDomains.textContent = fallback;
         }
@@ -538,15 +592,41 @@ const app = {
         this.ui.generateKeyError.textContent = '';
         this.ui.generatedKeyResult.hidden = true;
         if (!targetEmail) return;
+
+        // Resolve the requested expiry from the preset dropdown / custom input.
+        // The server clamps to [1, 3650] but we surface friendly errors for
+        // invalid custom values up-front so the user gets immediate feedback.
+        let expiresInDays = 30;
+        if (this.ui.keyExpiryPreset) {
+            const preset = this.ui.keyExpiryPreset.value;
+            if (preset === 'custom') {
+                const raw = this.ui.keyExpiryDays ? this.ui.keyExpiryDays.value : '';
+                const parsed = parseInt(raw, 10);
+                if (!Number.isFinite(parsed) || parsed < 1 || parsed > 3650) {
+                    this.ui.generateKeyError.textContent = 'Custom expiry must be a whole number between 1 and 3650 days.';
+                    return;
+                }
+                expiresInDays = parsed;
+            } else {
+                const parsedPreset = parseInt(preset, 10);
+                if (Number.isFinite(parsedPreset) && parsedPreset > 0) {
+                    expiresInDays = parsedPreset;
+                }
+            }
+        }
+
         try {
             const data = await this.handleApiCall('/api/admin/generate-key', {
                 method: 'POST',
-                body: JSON.stringify({ targetEmail })
+                body: JSON.stringify({ targetEmail, expiresInDays })
             });
             this.ui.generatedKeyValue.value = data.accessKey;
-            this.ui.generatedKeyExpires.textContent = `Expires: ${new Date(data.expiresAt).toLocaleDateString()}`;
+            const days = data.expiresInDays || expiresInDays;
+            const expiryDate = new Date(data.expiresAt);
+            this.ui.generatedKeyExpires.textContent =
+                `Expires: ${expiryDate.toLocaleDateString()} (${days} day${days === 1 ? '' : 's'})`;
             this.ui.generatedKeyResult.hidden = false;
-            this.showToast('success', 'Key Generated', 'Access key generated successfully!');
+            this.showToast('success', 'Key Generated', `Access key generated — valid for ${days} day${days === 1 ? '' : 's'}.`);
         } catch (err) {
             this.ui.generateKeyError.textContent = err.message;
         }
@@ -580,7 +660,7 @@ const app = {
 
     async loadInitialData() {
         try {
-            const [links, domains, stats, shortLinks, shortLinkStats, templates, dashboardStats, rateSummary, geoSummary, topLinks, hourlyStats, userProfile] = await Promise.all([
+            const [links, domains, stats, shortLinks, shortLinkStats, templates, dashboardStats, rateSummary, geoSummary, topLinks, hourlyStats, userProfile, botFeed, humanFeed, threats, domainHealth] = await Promise.all([
                 this.handleApiCall('/api/links'),
                 this.handleApiCall('/api/domains'),
                 this.handleApiCall('/api/stats/clicks-by-day?days=14'),
@@ -593,6 +673,10 @@ const app = {
                 this.handleApiCall('/api/stats/top-links?limit=10').catch(() => null),
                 this.handleApiCall('/api/stats/hourly?hours=24').catch(() => null),
                 this.handleApiCall('/api/me').catch(() => null),
+                this.handleApiCall('/api/analytics/bot-feed?limit=25').catch(() => null),
+                this.handleApiCall('/api/analytics/human-feed?limit=25').catch(() => null),
+                this.handleApiCall('/api/analytics/threats/top?days=7').catch(() => null),
+                this.handleApiCall('/api/analytics/domain-health?days=1').catch(() => null),
             ]);
             this.links = links || [];
             this.domains = domains || [];
@@ -613,6 +697,10 @@ const app = {
             this.renderTopLinks(topLinks);
             this.renderHourlyChart(hourlyStats);
             this.updateUserProfile(userProfile);
+            this.renderBotFeed(botFeed);
+            this.renderHumanFeed(humanFeed);
+            this.renderTopThreats(threats);
+            this.renderDomainHealth(domainHealth);
         } catch (err) {
             console.error("Failed to load initial data:", err);
         }
@@ -665,7 +753,18 @@ const app = {
             expiresAt: new Date(this.ui.expiresAtInput.value).toISOString(),
             customDomain: this.ui.customDomainSelect.value || undefined,
             templateId: this.ui.linkTemplateSelect.value ? parseInt(this.ui.linkTemplateSelect.value) : undefined,
+            singleUse: this.ui.singleUseInput ? this.ui.singleUseInput.checked : false
         };
+        // Optional per-link settings (Features 1, 2, 6, 7, 19) — only attached
+        // when the user filled them in. Server treats absent fields as no-op.
+        const _val = (id) => { const el = document.getElementById(id); return el && el.value.trim() ? el.value.trim() : null; };
+        const _maxClicks = _val('max-clicks-input');     if (_maxClicks)   linkData.maxClicks = Number(_maxClicks);
+        const _accessPin = _val('access-pin-input');     if (_accessPin)   linkData.accessPin = _accessPin;
+        const _cloakerProfile = _val('cloaker-profile-input'); if (_cloakerProfile) linkData.cloakerProfile = _cloakerProfile;
+        const _from = _val('active-from-input');         if (_from !== null) linkData.activeFromHour = Number(_from);
+        const _to   = _val('active-to-input');           if (_to !== null)   linkData.activeToHour = Number(_to);
+        const _tz   = _val('active-tz-input');           if (_tz)            linkData.activeTimezone = _tz;
+        const _wh   = _val('webhook-url-input');         if (_wh)            linkData.webhookUrl = _wh;
         try {
             const newLink = await this.handleApiCall('/api/links', {
                 method: 'POST',
@@ -697,10 +796,34 @@ const app = {
     },
 
     async addDomain() {
-        const hostname = this.ui.domainInput.value.trim();
+        // DNS enhancement: sanitize input — strip protocol, paths, query strings, and trailing dots.
+        // Users frequently paste "https://sub.example.com/" or "sub.example.com:443" — accept all
+        // forms but normalize to a bare hostname before sending to the server.
+        let raw = (this.ui.domainInput.value || '').trim().toLowerCase();
+        // Remove URL scheme and any leading "//"
+        raw = raw.replace(/^[a-z][a-z0-9+\-.]*:\/\//, '').replace(/^\/\//, '');
+        // Drop everything from the first slash, question mark, or hash onward
+        raw = raw.split(/[/?#]/, 1)[0];
+        // Strip credentials (user:pass@) if present
+        const atIndex = raw.lastIndexOf('@');
+        if (atIndex !== -1) raw = raw.slice(atIndex + 1);
+        // Strip port (last colon, but only if followed by digits — avoids breaking IPv6 which is unsupported here anyway)
+        raw = raw.replace(/:\d+$/, '');
+        // Strip trailing dot (FQDN root)
+        raw = raw.replace(/\.+$/, '');
+        const hostname = raw;
         const purpose = this.ui.domainPurposeSelect ? this.ui.domainPurposeSelect.value : 'link';
         this.ui.domainError.textContent = '';
         if (!hostname) return;
+        // Hostname format validation — must be a fully-qualified domain (at least two labels).
+        // Mirrors the server-side regex in POST /api/domains; single-label hostnames like
+        // "localhost" are intentionally rejected because Northflank / Cloudflare custom domains
+        // always require an FQDN.
+        const hostnameRegex = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+        if (!hostnameRegex.test(hostname)) {
+            this.ui.domainError.textContent = 'Please enter a valid domain (e.g., links.example.com).';
+            return;
+        }
         try {
             const newDomain = await this.handleApiCall('/api/domains', {
                 method: 'POST',
@@ -710,12 +833,12 @@ const app = {
             this.domains.push(newDomain);
             this.renderDomains();
             const purposeLabel = purpose === 'link' ? 'Link' : 'Web';
-            if (newDomain.railwayRegistered) {
-                this.showToast('success', 'Domain Added & Registered', `${hostname} has been added as a ${purposeLabel} domain and automatically registered with Railway. Run a DNS check after 1-2 minutes to verify.`);
-            } else if (newDomain.railwayApiConfigured === false) {
-                this.showToast('warning', 'Domain Added — Railway Setup Needed', `${hostname} added as a ${purposeLabel} domain. To make it work, set RAILWAY_TOKEN in your Railway environment variables for automatic registration, or add the domain manually in Railway's Custom Domain settings.`);
+            if (newDomain.northflankRegistered) {
+                this.showToast('success', 'Domain Added & Registered', `${hostname} has been added as a ${purposeLabel} domain and automatically registered with Northflank. Run a DNS check after 1-2 minutes to verify.`);
+            } else if (newDomain.northflankApiConfigured === false) {
+                this.showToast('warning', 'Domain Added — Northflank Setup Needed', `${hostname} added as a ${purposeLabel} domain. To make it work, set NORTHFLANK_API_TOKEN in your Northflank environment variables for automatic registration, or add the domain manually in Northflank's Ports & DNS settings.`);
             } else {
-                this.showToast('warning', 'Domain Added — Registration Failed', `${hostname} added as a ${purposeLabel} domain, but Railway auto-registration failed. Add the domain manually in Railway's Custom Domain settings, or click "Check DNS" to retry.`);
+                this.showToast('warning', 'Domain Added — Registration Failed', `${hostname} added as a ${purposeLabel} domain, but Northflank auto-registration failed. Add the domain manually in Northflank's Ports & DNS settings, or click "Check DNS" to retry.`);
             }
         } catch (err) {
             this.ui.domainError.textContent = err.message;
@@ -784,20 +907,22 @@ const app = {
                 domain.sslStatus = result.sslStatus || 'pending';
             }
             this.renderDomains();
+            // Render detailed instructions in the inline panel (always show after check)
+            this.showDnsCheckResult(result);
             if (result.cloudflareConflict) {
-                this.showToast('error', 'Cloudflare Error 1000', `${result.hostname}: DNS resolves to a Cloudflare IP with an A record pointing to a prohibited IP. Remove the A record and create a CNAME instead.`);
-            } else if (result.railwayAutoRegistered) {
-                this.showToast('success', 'Auto-Registered with Railway', `${result.hostname}: Domain was automatically registered with Railway! Wait 1-2 minutes for Railway to provision routing, then check DNS again.`);
-            } else if (result.railwayNotRegistered) {
-                if (result.railwayApiConfigured) {
-                    this.showToast('error', 'Railway Registration Failed', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. Auto-registration failed — click "Register with Railway" button or add it manually in Railway settings.`);
+                this.showToast('error', 'Cloudflare Error 1000', `${result.hostname}: DNS resolves to a Cloudflare IP with an A record pointing to a prohibited IP. See instructions panel below.`);
+            } else if (result.northflankAutoRegistered) {
+                this.showToast('success', 'Auto-Registered with Northflank', `${result.hostname}: Domain was automatically registered with Northflank! Wait 1-2 minutes for Northflank to provision routing, then check DNS again.`);
+            } else if (result.northflankNotRegistered) {
+                if (result.northflankApiConfigured) {
+                    this.showToast('error', 'Northflank Registration Failed', `${result.hostname}: Cloudflare proxy is working but Northflank does not recognize this domain. See instructions panel below.`);
                 } else {
-                    this.showToast('error', 'Domain Not Registered with Railway', `${result.hostname}: Cloudflare proxy is working but Railway does not recognize this domain. Set RAILWAY_TOKEN env var for automatic registration, or add it manually in Railway's Custom Domain settings.`);
+                    this.showToast('error', 'Domain Not Registered with Northflank', `${result.hostname}: Cloudflare proxy is working but Northflank does not recognize this domain. See instructions panel below.`);
                 }
             } else if (result.cfPending) {
                 this.showToast('warning', 'Cloudflare Propagating', `${result.hostname}: DNS resolves to Cloudflare IPs but HTTPS is not yet reachable. If you just set up the CNAME, wait 2-5 minutes and check again.`);
             } else if (result.sslStatus === 'cert_mismatch') {
-                this.showToast('error', 'SSL Certificate Mismatch', `${result.hostname}: HTTPS is reachable but the SSL certificate doesn't match your domain. Enable Cloudflare proxy (orange cloud) and set SSL to "Full" mode. See instructions below.`);
+                this.showToast('error', 'SSL Certificate Mismatch', `${result.hostname}: HTTPS is reachable but the SSL certificate doesn't match your domain. See instructions panel below.`);
             } else if (result.cloudflareProxied && result.sslReady) {
                 this.showToast('success', 'DNS Verified (CF Proxy)', `${result.hostname} is verified and working through Cloudflare proxy with SSL active!`);
             } else if (result.cloudflareProxied) {
@@ -805,31 +930,134 @@ const app = {
             } else if (result.dnsVerified && result.sslReady) {
                 this.showToast('success', 'DNS Verified', `${result.hostname} is fully configured with SSL!`);
             } else if (result.dnsVerified) {
-                this.showToast('success', 'DNS Verified', `${result.hostname} DNS is verified. SSL: ${result.sslStatus}. Check setup instructions below.`);
+                this.showToast('success', 'DNS Verified', `${result.hostname} DNS is verified. SSL: ${result.sslStatus}. See instructions panel below.`);
             } else {
-                this.showToast('warning', 'DNS Not Verified', `Point ${result.hostname} CNAME to your server. See instructions in the DNS info box.`);
+                this.showToast('warning', 'DNS Not Verified', `Point ${result.hostname} CNAME to your server. See instructions panel below.`);
             }
         } catch (err) {
             this.showToast('error', 'DNS Check Failed', err.message);
         }
     },
-
-    async registerDomainWithRailway(domainId) {
+
+    /**
+     * Render DNS check result details in the inline instructions panel.
+     * Uses textContent (safe from XSS) and exposes the rich `instructions`
+     * array returned by GET /api/domains/:id/dns-check.
+     */
+    showDnsCheckResult(result) {
+        if (!this.ui.dnsCheckPanel || !this.ui.dnsCheckInstructions) return;
+        const title = this.ui.dnsCheckTitle;
+        const summary = this.ui.dnsCheckSummary;
+        const list = this.ui.dnsCheckInstructions;
+
+        if (title) title.textContent = `DNS Check Results — ${result.hostname || 'unknown'}`;
+
+        // Build summary using safe DOM manipulation (no innerHTML on user data)
+        if (summary) {
+            summary.textContent = '';
+            const dnsBadge = document.createElement('span');
+            dnsBadge.className = 'badge ' + (result.dnsVerified ? 'badge-success' : 'badge-warning');
+            dnsBadge.textContent = result.dnsVerified ? '✓ DNS Verified' : '⚠️ DNS Not Verified';
+            const sslBadge = document.createElement('span');
+            sslBadge.className = 'badge ' + (result.sslReady ? 'badge-success' : 'badge-warning');
+            sslBadge.textContent = result.sslReady ? '✓ SSL Active' : (result.sslStatus ? `SSL: ${result.sslStatus}` : 'SSL: pending');
+            sslBadge.style.marginLeft = '6px';
+            summary.appendChild(dnsBadge);
+            summary.appendChild(sslBadge);
+
+            if (result.cname && result.cname.length) {
+                const cnameInfo = document.createElement('div');
+                cnameInfo.style.marginTop = '4px';
+                cnameInfo.style.fontSize = '0.8rem';
+                cnameInfo.textContent = `CNAME → ${result.cname.join(', ')}`;
+                summary.appendChild(cnameInfo);
+            }
+            if (result.a && result.a.length) {
+                const aInfo = document.createElement('div');
+                aInfo.style.marginTop = '4px';
+                aInfo.style.fontSize = '0.8rem';
+                aInfo.textContent = `A → ${result.a.join(', ')}`;
+                summary.appendChild(aInfo);
+            }
+        }
+
+        // Render instructions list (textContent prevents any HTML injection)
+        list.textContent = '';
+        const instructions = Array.isArray(result.instructions) ? result.instructions : [];
+        if (instructions.length === 0) {
+            const li = document.createElement('li');
+            li.textContent = result.dnsVerified ? 'Domain is fully configured.' : 'No specific instructions returned.';
+            list.appendChild(li);
+        } else {
+            instructions.forEach(line => {
+                if (!line || typeof line !== 'string') return;
+                const li = document.createElement('li');
+                if (line.trim() === '') {
+                    li.style.listStyle = 'none';
+                    // Use a non-breaking space text node (consistent with the textContent
+                    // XSS-prevention strategy used throughout this method).
+                    li.textContent = '\u00A0';
+                } else {
+                    li.textContent = line;
+                }
+                list.appendChild(li);
+            });
+        }
+        this.ui.dnsCheckPanel.hidden = false;
+        // Scroll the panel into view so users see the new results immediately
+        try { this.ui.dnsCheckPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) { /* noop */ }
+    },
+
+    /**
+     * Run DNS check sequentially for all connected domains.
+     * Sequential execution avoids overwhelming the DNS resolver and gives
+     * clear per-domain feedback in the UI.
+     */
+    async checkAllDomainsDns() {
+        if (!this.domains || this.domains.length === 0) {
+            this.showToast('warning', 'No Domains', 'No connected domains to check.');
+            return;
+        }
+        this.showToast('info', 'Checking All Domains', `Running DNS check for ${this.domains.length} domain(s)...`);
+        let lastResult = null;
+        let successCount = 0;
+        for (const domain of this.domains) {
+            try {
+                const result = await this.handleApiCall(`/api/domains/${domain.id}/dns-check`);
+                domain.dnsVerified = result.dnsVerified ? 1 : 0;
+                domain.sslStatus = result.sslStatus || 'pending';
+                if (result.dnsVerified) successCount += 1;
+                lastResult = result;
+            } catch (err) {
+                console.warn('DNS check failed for', domain.hostname, err);
+            }
+        }
+        this.renderDomains();
+        if (lastResult) this.showDnsCheckResult(lastResult);
+        this.showToast(
+            successCount === this.domains.length ? 'success' : 'info',
+            'DNS Check Complete',
+            `${successCount}/${this.domains.length} domain(s) verified.`
+        );
+    },
+
+
+    async registerDomainWithNorthflank(domainId) {
         try {
-            this.showToast('info', 'Railway Registration', 'Registering domain with Railway...');
-            const result = await this.handleApiCall(`/api/domains/${domainId}/railway-register`, { method: 'POST' });
+            this.showToast('info', 'Northflank Registration', 'Registering domain with Northflank...');
+            const result = await this.handleApiCall(`/api/domains/${domainId}/northflank-register`, { method: 'POST' });
             if (result.needsToken) {
-                this.showToast('error', 'Railway Token Required', 'Set RAILWAY_TOKEN in your Railway environment variables. Go to Railway dashboard → Account → Tokens to generate one.');
+                this.showToast('error', 'Northflank Token Required', 'Set NORTHFLANK_API_TOKEN in your Northflank environment variables. Go to Northflank dashboard → Account Settings → API Tokens to generate one.');
             } else if (result.alreadyRegistered) {
-                this.showToast('info', 'Already Registered', 'This domain is already registered with Railway. Run DNS check to verify status.');
+                this.showToast('info', 'Already Registered', 'This domain is already registered with Northflank. Run DNS check to verify status.');
             } else if (result.success) {
-                this.showToast('success', 'Registered with Railway', 'Domain registered successfully! Wait 1-2 minutes for Railway to provision routing, then check DNS again.');
+                this.showToast('success', 'Registered with Northflank', 'Domain registered successfully! Wait 1-2 minutes for Northflank to provision routing, then check DNS again.');
                 const domain = this.domains.find(d => d.id === parseInt(domainId));
                 if (domain) { domain.sslStatus = 'provisioning'; }
                 this.renderDomains();
             }
         } catch (err) {
-            this.showToast('error', 'Railway Registration Failed', err.message);
+            this.showToast('error', 'Northflank Registration Failed', err.message);
         }
     },
 
@@ -909,6 +1137,9 @@ const app = {
                     <div class="action-buttons">
                         <button class="action-btn copy-btn" data-url="${shortUrl}" title="Copy">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        </button>
+                        <button class="action-btn qr-btn" data-slug="${link.slug}" title="QR Code">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="3" height="3"></rect><rect x="18" y="18" width="3" height="3"></rect></svg>
                         </button>
                         <button class="action-btn analytics-btn" data-slug="${link.slug}" title="Analytics">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
@@ -1334,10 +1565,10 @@ const app = {
         this.domains.forEach(domain => {
             const purposeLabel = domain.purpose === 'web' ? 'Web' : 'Link';
             const purposeBadge = domain.purpose === 'web' ? 'badge-info' : 'badge-warning';
-            const dnsBadge = domain.dnsVerified ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'railway_not_registered' ? 'badge-error' : 'badge-warning');
-            const dnsLabel = domain.dnsVerified ? '✓ Verified' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ CF Error' : (domain.sslStatus === 'railway_not_registered' ? '⚠️ Not in Railway' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : 'Unverified')));
-            const sslBadge = domain.sslStatus === 'active' ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'railway_not_registered' ? 'badge-error' : (domain.sslStatus === 'cert_mismatch' ? 'badge-error' : 'badge-warning'));
-            const sslLabel = domain.sslStatus === 'active' ? '✓ Active' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ Fix DNS' : (domain.sslStatus === 'railway_not_registered' ? '⚠️ Add to Railway' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : (domain.sslStatus === 'cert_mismatch' ? '⚠️ Cert Mismatch' : 'Pending'))));
+            const dnsBadge = domain.dnsVerified ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'northflank_not_registered' ? 'badge-error' : 'badge-warning');
+            const dnsLabel = domain.dnsVerified ? '✓ Verified' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ CF Error' : (domain.sslStatus === 'northflank_not_registered' ? '⚠️ Not in Northflank' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : 'Unverified')));
+            const sslBadge = domain.sslStatus === 'active' ? 'badge-success' : (domain.sslStatus === 'cloudflare_conflict' || domain.sslStatus === 'northflank_not_registered' ? 'badge-error' : (domain.sslStatus === 'cert_mismatch' ? 'badge-error' : 'badge-warning'));
+            const sslLabel = domain.sslStatus === 'active' ? '✓ Active' : (domain.sslStatus === 'cloudflare_conflict' ? '⚠️ Fix DNS' : (domain.sslStatus === 'northflank_not_registered' ? '⚠️ Add to Northflank' : (domain.sslStatus === 'provisioning' ? '⏳ Provisioning' : (domain.sslStatus === 'cert_mismatch' ? '⚠️ Cert Mismatch' : 'Pending'))));
             // Build template options for domain-level assignment
             let templateOptions = '<option value="">System Default</option>';
             if (this.templates && this.templates.length > 0) {
@@ -1346,8 +1577,8 @@ const app = {
                     templateOptions += `<option value="${t.id}" ${selected}>${t.name}</option>`;
                 });
             }
-            const railwayBtn = domain.sslStatus === 'railway_not_registered'
-                ? `<button class="action-btn railway-register-btn" data-id="${domain.id}" title="Register with Railway" style="margin-right:4px;font-size:0.7rem;padding:2px 6px;background:#7c3aed;border-radius:4px;color:#fff;">🚂 Register</button>`
+            const northflankBtn = domain.sslStatus === 'northflank_not_registered'
+                ? `<button class="action-btn northflank-register-btn" data-id="${domain.id}" title="Register with Northflank" style="margin-right:4px;font-size:0.7rem;padding:2px 6px;background:#7c3aed;border-radius:4px;color:#fff;">🔗 Register</button>`
                 : '';
             const tr = document.createElement('tr');
             tr.innerHTML = `
@@ -1368,7 +1599,7 @@ const app = {
                 </td>
                 <td data-label="SSL"><span class="badge ${sslBadge}">${sslLabel}</span></td>
                 <td data-label="Actions" class="text-right">
-                    ${railwayBtn}<button class="action-btn delete-btn" data-id="${domain.id}" title="Delete">
+                    ${northflankBtn}<button class="action-btn delete-btn" data-id="${domain.id}" title="Delete">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                     </button>
                 </td>
@@ -1832,6 +2063,146 @@ const app = {
         this.ui.topLinksBody.innerHTML = html;
     },
 
+    // ==================== BOT FEED / HUMAN FEED / THREATS / DOMAIN HEALTH ====================
+    _esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    },
+
+    _formatTime(ts) {
+        try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts); }
+    },
+
+    _shortUa(ua) {
+        if (!ua) return 'unknown';
+        const s = String(ua);
+        return s.length > 60 ? s.substring(0, 60) + '…' : s;
+    },
+
+    _confidenceBadge(c) {
+        const cls = c === 'high' ? 'rate-bot' : (c === 'medium' ? 'rate-total' : '');
+        return `<span class="rate-number ${cls}" style="font-size:0.7rem;padding:2px 6px;">${this._esc(c || 'low')}</span>`;
+    },
+
+    renderBotFeed(data) {
+        const el = document.getElementById('bot-feed-body');
+        if (!el) return;
+        if (!data || data.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No bot activity yet.</div>';
+            return;
+        }
+        let html = '<div class="bot-feed-list">';
+        data.forEach(b => {
+            const sigs = (b.botSignals || []).slice(0, 3).map(s => `<span class="rate-number" style="font-size:0.7rem;padding:2px 6px;background:#fee2e2;color:#991b1b;border-radius:4px;margin-right:4px;">${this._esc(s)}</span>`).join(' ');
+            html += `
+                <div class="feed-item bot" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px;border-bottom:1px solid rgba(148,163,184,0.15);">
+                    <div style="flex:1;min-width:0;">
+                        <div style="display:flex;gap:8px;align-items:center;font-size:0.85rem;font-weight:600;">
+                            🤖 ${this._esc(b.country || '??')} · score ${this._esc(b.botScore || 0)} · ${this._confidenceBadge(b.botConfidence)}
+                        </div>
+                        <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px;">${this._esc(this._shortUa(b.userAgent))}</div>
+                        <div style="margin-top:6px;">${sigs}</div>
+                    </div>
+                    <div style="font-size:0.7rem;color:#64748b;white-space:nowrap;">${this._formatTime(b.timestamp)}</div>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderHumanFeed(data) {
+        const el = document.getElementById('human-feed-body');
+        if (!el) return;
+        if (!data || data.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No human visits yet.</div>';
+            return;
+        }
+        let html = '<div class="human-feed-list">';
+        data.forEach(h => {
+            let host = '';
+            try { host = new URL(h.destinationUrlDesktop || h.destinationUrl || '').hostname; } catch (e) {}
+            html += `
+                <div class="feed-item human" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px;border-bottom:1px solid rgba(148,163,184,0.15);">
+                    <div style="flex:1;min-width:0;">
+                        <div style="font-size:0.85rem;font-weight:600;">
+                            👤 ${this._esc(h.country || '??')} ${h.isUnique ? '· <span style="color:#22c55e;">new visitor</span>' : ''}
+                        </div>
+                        <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px;">→ ${this._esc(host)}</div>
+                        <div style="font-size:0.7rem;color:#64748b;margin-top:2px;">${this._esc(this._shortUa(h.userAgent))}</div>
+                    </div>
+                    <div style="font-size:0.7rem;color:#64748b;white-space:nowrap;">${this._formatTime(h.timestamp)}</div>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderTopThreats(data) {
+        const el = document.getElementById('top-threats-body');
+        if (!el) return;
+        if (!data || (!data.topUserAgents?.length && !data.topCountries?.length && !data.topSignals?.length)) {
+            el.innerHTML = '<div class="empty-state-sm">No threats detected in this period.</div>';
+            return;
+        }
+        let html = '<div style="display:flex;flex-direction:column;gap:12px;">';
+        if (data.topSignals && data.topSignals.length) {
+            html += '<div><div style="font-weight:600;font-size:0.8rem;color:#94a3b8;margin-bottom:4px;">Top signals</div>';
+            data.topSignals.slice(0, 8).forEach(s => {
+                html += `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0;border-bottom:1px dashed rgba(148,163,184,0.1);">
+                    <span title="${this._esc(s.signal)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:75%;">${this._esc(s.signal)}</span>
+                    <strong>${this._esc(s.hits)}</strong>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        if (data.topCountries && data.topCountries.length) {
+            html += '<div><div style="font-weight:600;font-size:0.8rem;color:#94a3b8;margin-bottom:4px;">Bot countries</div>';
+            data.topCountries.slice(0, 8).forEach(c => {
+                html += `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0;border-bottom:1px dashed rgba(148,163,184,0.1);">
+                    <span>${this._esc(c.country)}</span><strong>${this._esc(c.hits)}</strong>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    renderDomainHealth(data) {
+        const el = document.getElementById('domain-health-body');
+        if (!el) return;
+        if (!data || !data.domains || data.domains.length === 0) {
+            el.innerHTML = '<div class="empty-state-sm">No domain activity yet.</div>';
+            return;
+        }
+        const colors = { green: '#22c55e', amber: '#f59e0b', red: '#ef4444' };
+        let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
+        data.domains.forEach(d => {
+            const color = colors[d.status] || '#94a3b8';
+            html += `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-left:3px solid ${color};background:rgba(148,163,184,0.05);border-radius:4px;">
+                    <div>
+                        <div style="font-weight:600;font-size:0.85rem;">${this._esc(d.domain)}</div>
+                        <div style="font-size:0.7rem;color:#94a3b8;">${this._esc(d.totalClicks)} clicks · ${this._esc(d.botRatio)}% bots</div>
+                    </div>
+                    <span style="background:${color};color:#fff;font-size:0.7rem;padding:2px 8px;border-radius:10px;text-transform:uppercase;">${this._esc(d.status)}</span>
+                </div>`;
+        });
+        html += '</div>';
+        el.innerHTML = html;
+    },
+
+    async refreshBotFeed() {
+        const data = await this.handleApiCall('/api/analytics/bot-feed?limit=25').catch(() => null);
+        this.renderBotFeed(data);
+    },
+
+    async refreshHumanFeed() {
+        const data = await this.handleApiCall('/api/analytics/human-feed?limit=25').catch(() => null);
+        this.renderHumanFeed(data);
+    },
+
     renderHourlyChart(data) {
         if (typeof Chart === 'undefined') return;
         if (!this.ui.hourlyChartCanvas) return;
@@ -1954,4 +2325,248 @@ const app = {
 
 document.addEventListener('DOMContentLoaded', () => {
     app.init();
+    if (typeof initMoreTools === 'function') initMoreTools(app);
 });
+
+// ============================================================================
+// MORE TOOLS UI MODULE — wires up Features 4, 6, 8, 11, 12, 18, 19, 20.
+//
+// Self-contained: depends only on `app.handleApiCall(...)` (auth-aware fetch),
+// `app.showToast(...)` and the DOM elements created in `index.html` under
+// `#more-tools-section`. Safe to call multiple times — handlers are added
+// once and tables re-render on demand.
+// ============================================================================
+function initMoreTools(app) {
+    const $ = (id) => document.getElementById(id);
+
+    // --- Feature 8: CSV Bulk Import ---
+    // Tiny RFC 4180-aware parser (handles quoted fields with commas + escaped quotes).
+    function parseCsv(text) {
+        const rows = [];
+        let row = [], field = '', inQuotes = false;
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (inQuotes) {
+                if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+                else if (c === '"') inQuotes = false;
+                else field += c;
+            } else {
+                if (c === '"') inQuotes = true;
+                else if (c === ',') { row.push(field); field = ''; }
+                else if (c === '\r') { /* skip */ }
+                else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+                else field += c;
+            }
+        }
+        if (field || row.length) { row.push(field); rows.push(row); }
+        return rows.filter(r => r.length > 1 || (r[0] && r[0].trim()));
+    }
+    if ($('csv-import-btn')) {
+        $('csv-import-btn').addEventListener('click', async () => {
+            const file = $('csv-import-file').files[0];
+            const out = $('csv-import-result');
+            if (!file) { out.textContent = 'Please choose a CSV file first.'; return; }
+            try {
+                const text = await file.text();
+                const rows = parseCsv(text);
+                if (rows.length < 2) throw new Error('CSV must have a header row and at least one data row.');
+                const header = rows[0].map(h => h.trim());
+                const idx = (name) => header.indexOf(name);
+                const destIdx = idx('destinationUrl');
+                if (destIdx < 0) throw new Error('Missing required column: destinationUrl');
+                const links = rows.slice(1).filter(r => r[destIdx]).map(r => {
+                    const obj = { destinationUrl: r[destIdx].trim() };
+                    if (idx('tags') >= 0)       obj.tags = r[idx('tags')];
+                    if (idx('notes') >= 0)      obj.notes = r[idx('notes')];
+                    if (idx('expiresAt') >= 0 && r[idx('expiresAt')]) obj.expiresAt = r[idx('expiresAt')];
+                    if (idx('maxClicks') >= 0 && r[idx('maxClicks')]) obj.maxClicks = parseInt(r[idx('maxClicks')], 10);
+                    return obj;
+                });
+                if (links.length === 0) throw new Error('No valid data rows found.');
+                out.textContent = `Posting ${links.length} link(s)…`;
+                const result = await app.handleApiCall('/api/links/batch', {
+                    method: 'POST', body: JSON.stringify({ links })
+                });
+                out.textContent = 'Imported: ' + JSON.stringify(result, null, 2);
+                app.showToast && app.showToast('success', 'CSV Import', `${links.length} link(s) submitted.`);
+            } catch (e) {
+                out.textContent = 'Error: ' + e.message;
+                app.showToast && app.showToast('error', 'CSV Import', e.message);
+            }
+        });
+    }
+
+    // --- Feature 11: API Keys ---
+    async function loadApiKeys() {
+        if (!$('api-keys-tbody')) return;
+        try {
+            const list = await app.handleApiCall('/api/api-keys');
+            $('api-keys-tbody').innerHTML = list.map(k => `
+                <tr>
+                  <td>${escapeHtml(k.name)}</td>
+                  <td><code>${escapeHtml(k.keyPrefix)}…</code></td>
+                  <td>${k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : '—'}</td>
+                  <td>${new Date(k.createdAt).toLocaleDateString()}</td>
+                  <td>${k.revokedAt
+                    ? '<span style="color:#999">revoked</span>'
+                    : `<button class="btn btn-sm" data-revoke="${k.id}">Revoke</button>`}</td>
+                </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#999">No API keys yet.</td></tr>';
+            $('api-keys-tbody').querySelectorAll('[data-revoke]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    if (!confirm('Revoke this API key? This cannot be undone.')) return;
+                    await app.handleApiCall(`/api/api-keys/${btn.dataset.revoke}`, { method: 'DELETE' });
+                    loadApiKeys();
+                });
+            });
+        } catch (e) { /* ignore until logged in */ }
+    }
+    if ($('api-key-create-btn')) {
+        $('api-key-create-btn').addEventListener('click', async () => {
+            const name = $('api-key-name').value.trim();
+            if (!name) { app.showToast && app.showToast('error', 'API Key', 'Please enter a name.'); return; }
+            try {
+                const result = await app.handleApiCall('/api/api-keys', { method: 'POST', body: JSON.stringify({ name }) });
+                const box = $('api-key-new');
+                box.style.display = 'block';
+                box.innerHTML = `<strong>Save this token now — it will not be shown again:</strong>
+                    <pre style="margin:.5rem 0;user-select:all;background:#fff;padding:.5rem;border-radius:4px;word-break:break-all">${escapeHtml(result.key)}</pre>`;
+                $('api-key-name').value = '';
+                loadApiKeys();
+            } catch (e) { app.showToast && app.showToast('error', 'API Key', e.message); }
+        });
+    }
+
+    // --- Feature 6: account-level webhook ---
+    if ($('account-webhook-save-btn')) {
+        $('account-webhook-save-btn').addEventListener('click', async () => {
+            const url = $('account-webhook-url').value.trim();
+            try {
+                await app.handleApiCall('/api/me/webhook', {
+                    method: 'PATCH', body: JSON.stringify({ webhookUrl: url || null })
+                });
+                app.showToast && app.showToast('success', 'Webhook', url ? 'Saved.' : 'Cleared.');
+            } catch (e) { app.showToast && app.showToast('error', 'Webhook', e.message); }
+        });
+    }
+
+    // --- Feature 12: heatmap + funnel ---
+    async function loadHeatmap() {
+        if (!$('heatmap-container')) return;
+        try {
+            const data = await app.handleApiCall('/api/stats/click-heatmap?days=30');
+            // Find max for color scaling
+            let max = 0;
+            for (const row of data.matrix) for (const v of row) if (v > max) max = v;
+            const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+            let html = '<table style="border-collapse:collapse;font-size:.7rem"><tr><th></th>';
+            for (let h = 0; h < 24; h++) html += `<th style="padding:2px 4px">${h}</th>`;
+            html += '</tr>';
+            for (let d = 0; d < 7; d++) {
+                html += `<tr><td style="padding:2px 6px;font-weight:600">${days[d]}</td>`;
+                for (let h = 0; h < 24; h++) {
+                    const v = data.matrix[d][h] || 0;
+                    const intensity = max > 0 ? Math.round((v / max) * 100) : 0;
+                    const bg = intensity > 0 ? `rgba(79,70,229,${0.15 + intensity * 0.0085})` : '#f3f4f6';
+                    html += `<td title="${days[d]} ${h}:00 — ${v} clicks" style="width:18px;height:18px;background:${bg};border:1px solid #fff"></td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</table>';
+            $('heatmap-container').innerHTML = html;
+        } catch (e) { /* ignore */ }
+    }
+    async function loadFunnel() {
+        if (!$('funnel-container')) return;
+        try {
+            const f = await app.handleApiCall('/api/stats/conversion-funnel?days=7');
+            $('funnel-container').innerHTML = `
+                <ul style="list-style:none;padding:0;margin:0">
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Impressions: <strong>${f.impressions}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Unlock attempts (humans): <strong>${f.unlockAttempts}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Successful unlocks: <strong>${f.successfulUnlocks}</strong></li>
+                    <li style="padding:.4rem 0;border-bottom:1px solid #e5e7eb">Bot blocks: <strong>${f.botBlocks}</strong></li>
+                    <li style="padding:.4rem 0">Bot redirect hops served: <strong>${f.botRedirectHops}</strong></li>
+                </ul>`;
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- Feature 18: Recycle Bin ---
+    async function loadTrash() {
+        if (!$('trash-tbody')) return;
+        try {
+            const list = await app.handleApiCall('/api/links/trash');
+            $('trash-tbody').innerHTML = list.map(l => `
+                <tr>
+                    <td><code>${escapeHtml(l.id)}</code></td>
+                    <td><span title="${escapeHtml(l.destinationUrlDesktop || '')}">${escapeHtml((l.destinationUrlDesktop || '').slice(0, 50))}</span></td>
+                    <td>${l.deletedAt ? new Date(l.deletedAt).toLocaleString() : ''}</td>
+                    <td><button class="btn btn-sm" data-restore="${escapeHtml(l.id)}">Restore</button></td>
+                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:#999">Trash is empty.</td></tr>';
+            $('trash-tbody').querySelectorAll('[data-restore]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    await app.handleApiCall(`/api/links/${encodeURIComponent(btn.dataset.restore)}/restore`, { method: 'POST' });
+                    loadTrash();
+                    app.showToast && app.showToast('success', 'Restore', 'Link restored.');
+                });
+            });
+        } catch (e) { /* ignore */ }
+    }
+    if ($('trash-refresh-btn')) $('trash-refresh-btn').addEventListener('click', loadTrash);
+
+    // --- Feature 19: Cloaker presets display ---
+    async function loadPresets() {
+        if (!$('cloaker-presets-display')) return;
+        try {
+            const p = await app.handleApiCall('/api/cloaker-presets');
+            $('cloaker-presets-display').textContent = JSON.stringify(p, null, 2);
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- Feature 20: Export / Import ---
+    if ($('account-export-btn')) {
+        $('account-export-btn').addEventListener('click', async () => {
+            try {
+                // Use raw fetch so we can stream the file download
+                const r = await fetch('/api/account/export', { headers: app.token ? { 'Authorization': 'Bearer ' + app.token } : {} });
+                if (!r.ok) throw new Error('Export failed: ' + r.status);
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `account-export-${Date.now()}.json`;
+                document.body.appendChild(a); a.click(); a.remove();
+                URL.revokeObjectURL(url);
+            } catch (e) { app.showToast && app.showToast('error', 'Export', e.message); }
+        });
+    }
+    if ($('account-import-btn')) {
+        $('account-import-btn').addEventListener('click', async () => {
+            const file = $('account-import-file').files[0];
+            const out = $('account-import-result');
+            if (!file) { out.textContent = 'Choose an export JSON file.'; return; }
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                const result = await app.handleApiCall('/api/account/import', {
+                    method: 'POST', body: JSON.stringify(data)
+                });
+                out.textContent = 'Imported: ' + JSON.stringify(result.imported || result, null, 2);
+                app.showToast && app.showToast('success', 'Import', 'Account data imported.');
+            } catch (e) { out.textContent = 'Error: ' + e.message; }
+        });
+    }
+
+    // Activate when section becomes visible
+    function refreshAll() {
+        loadApiKeys(); loadHeatmap(); loadFunnel(); loadTrash(); loadPresets();
+    }
+    // Best-effort: auto-load when user clicks the "More Tools" nav link
+    document.querySelectorAll('a[href="#more-tools-section"]').forEach(a => {
+        a.addEventListener('click', () => setTimeout(refreshAll, 100));
+    });
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+}

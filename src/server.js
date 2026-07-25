@@ -30,6 +30,9 @@ const safeRedirectChain = require('./lib/safeRedirectChain');
 const config = require('./config');
 const auth = require('./lib/auth');
 const fraudAnalyzer = require('./lib/fraud');
+const featuresExtra = require('./lib/featuresExtra');
+const apiKeyManager = require('./lib/apiKeyManager');
+const { buildExtraRouter } = require('./lib/extraRoutes');
 
 console.log(chalk.green('[SYSTEM] All local modules loaded successfully. '));
 
@@ -83,122 +86,181 @@ const LINK_DOMAIN = (config.linkDomain || '').toLowerCase().replace(/^https?:\/\
 // Allowed path prefixes on the link domain (tracking, unlock, and safe redirect chain routes only)
 const LINK_DOMAIN_ALLOWED_PATHS = ['/tr/', '/p/', '/s/', '/sr/', '/health'];
 
-// Markers in Railway's "Not Found" HTML page — used to detect when a domain is NOT
-// registered as a custom domain in Railway's service settings (traffic reaches Railway
-// via Cloudflare proxy but Railway rejects it with its own branded 404 page).
-const RAILWAY_NOT_FOUND_MARKERS = ['the train has not arrived', 'domain has provisioned', 'go to railway'];
+// Markers in Northflank's default/unrouted HTML pages — used to detect when a domain is NOT
+// linked to this service port in Northflank. These are intentionally conservative and include
+// generic not-found markers so we do not depend on one exact branded page.
+const NORTHFLANK_NOT_FOUND_MARKERS = [
+    'northflank',
+    'no service found',
+    'application not found',
+    'domain is not configured',
+    'no route found',
+    'unrouted domain'
+];
 
-// ==================== RAILWAY API INTEGRATION ====================
-// Auto-register/unregister custom domains with Railway via their GraphQL API.
-// Requires RAILWAY_TOKEN env var (generated in Railway dashboard → Account → Tokens).
-// RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID are auto-injected by Railway at runtime.
+// ==================== NORTHFLANK API INTEGRATION ====================
+// Auto-register/unregister custom domains with Northflank via their REST API.
+// Requires NORTHFLANK_API_TOKEN, NORTHFLANK_PROJECT_ID, and NORTHFLANK_SERVICE_ID env vars.
 
-const RAILWAY_API_URL = 'https://backboard.railway.app/graphql/v2';
+const NORTHFLANK_API_URL = 'https://api.northflank.com';
 
 /**
- * Check if Railway API credentials are configured.
+ * Check if Northflank API credentials are configured.
  */
-function isRailwayApiConfigured() {
-    return !!(config.railwayToken && config.railwayServiceId && config.railwayEnvironmentId);
+function isNorthflankApiConfigured() {
+    return !!(config.northflankApiToken && config.northflankProjectId && config.northflankServiceId);
 }
 
 /**
- * Execute a Railway GraphQL API request.
- * @param {string} query - GraphQL query/mutation
- * @param {object} variables - GraphQL variables
+ * Execute a Northflank REST API request.
+ * @param {string} method - HTTP method
+ * @param {string} apiPath - API path beginning with /v1
+ * @param {object|null} body - JSON body
  * @returns {Promise<object>} - Parsed response data
  */
-function railwayApiRequest(query, variables = {}) {
+function northflankApiRequest(method, apiPath, body = null) {
     return new Promise((resolve, reject) => {
-        const payload = JSON.stringify({ query, variables });
-        const url = new URL(RAILWAY_API_URL);
+        const payload = body ? JSON.stringify(body) : '';
+        const url = new URL(apiPath, NORTHFLANK_API_URL);
+        const headers = {
+            'Accept': 'application/json',
+            'Authorization': 'Bearer ' + config.northflankApiToken,
+        };
+        if (payload) {
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(payload);
+        }
         const options = {
             hostname: url.hostname,
             port: 443,
-            path: url.pathname,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.railwayToken}`,
-                'Content-Length': Buffer.byteLength(payload),
-            },
+            path: url.pathname + url.search,
+            method,
+            headers,
             timeout: 15000,
         };
         const req = https.request(options, (res) => {
-            let body = '';
-            res.on('data', chunk => { body += chunk; });
+            let responseBody = '';
+            res.on('data', chunk => { responseBody += chunk; });
             res.on('end', () => {
-                try {
-                    const data = JSON.parse(body);
-                    if (data.errors && data.errors.length > 0) {
-                        reject(new Error(data.errors[0].message || 'Railway API error'));
-                    } else {
-                        resolve(data.data);
+                let data = {};
+                if (responseBody) {
+                    try {
+                        data = JSON.parse(responseBody);
+                    } catch (e) {
+                        const err = new Error(`Northflank API returned invalid JSON: ${responseBody.slice(0, 200)}`);
+                        err.statusCode = res.statusCode;
+                        return reject(err);
                     }
-                } catch (e) {
-                    reject(new Error(`Railway API returned invalid JSON: ${body.slice(0, 200)}`));
                 }
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    const errMsg = data.message || data.error || data.detail || `Northflank API error (HTTP ${res.statusCode})`;
+                    const err = new Error(errMsg);
+                    err.statusCode = res.statusCode;
+                    err.response = data;
+                    return reject(err);
+                }
+                resolve(data);
             });
         });
-        req.on('error', (e) => reject(new Error(`Railway API connection failed: ${e.message}`)));
-        req.on('timeout', () => { req.destroy(); reject(new Error('Railway API request timed out')); });
-        req.write(payload);
+        req.on('error', (e) => reject(new Error(`Northflank API connection failed: ${e.message}`)));
+        req.on('timeout', () => { req.destroy(); reject(new Error('Northflank API request timed out')); });
+        if (payload) req.write(payload);
         req.end();
     });
 }
 
+async function assignDomainToNorthflank(domain) {
+    const payload = {
+        serviceId: config.northflankServiceId,
+        projectId: config.northflankProjectId,
+        portName: config.northflankPortName || 'p01',
+    };
+    const encodedDomain = encodeURIComponent(domain);
+    const attempts = [
+        `/v1/domains/${encodedDomain}/assign`,
+        `/v1/domains/${encodedDomain}/subdomains/${encodeURIComponent('@')}/assign`,
+    ];
+    let lastError = null;
+    for (const pathToTry of attempts) {
+        try {
+            await northflankApiRequest('POST', pathToTry, payload);
+            return true;
+        } catch (e) {
+            lastError = e;
+            if (e.statusCode && e.statusCode !== 404 && e.statusCode !== 405) throw e;
+        }
+    }
+    if (lastError) throw lastError;
+    return false;
+}
+
 /**
- * Register a custom domain with Railway.
+ * Register and assign a custom domain with Northflank.
  * @param {string} domain - The domain hostname to register
- * @returns {Promise<{id: string, domain: string}|null>} - Railway domain object or null on failure
+ * @returns {Promise<{id: string, domain: string, assigned: boolean}|null>} - Northflank domain object or null on failure
  */
-async function registerDomainWithRailway(domain) {
-    if (!isRailwayApiConfigured()) {
-        console.log(chalk.yellow(`[RAILWAY-API] Skipping domain registration — RAILWAY_TOKEN not configured.`));
+async function registerDomainWithNorthflank(domain) {
+    if (!isNorthflankApiConfigured()) {
+        console.log(chalk.yellow(`[NORTHFLANK-API] Skipping domain registration — NORTHFLANK_API_TOKEN not configured.`));
         return null;
     }
     try {
-        console.log(chalk.blue(`[RAILWAY-API] Registering domain "${domain}" with Railway...`));
-        const data = await railwayApiRequest(
-            `mutation($input: CustomDomainCreateInput!) {
-                customDomainCreate(input: $input) { id domain }
-            }`,
-            {
-                input: {
-                    domain: domain,
-                    serviceId: config.railwayServiceId,
-                    environmentId: config.railwayEnvironmentId,
-                }
+        console.log(chalk.blue(`[NORTHFLANK-API] Registering domain "${domain}" with Northflank...`));
+        let created;
+        try {
+            created = await northflankApiRequest('POST', '/v1/domains', { domain });
+        } catch (e) {
+            const msg = (e.message || '').toLowerCase();
+            if (e.statusCode === 409 || msg.includes('already') || msg.includes('exists')) {
+                console.log(chalk.yellow(`[NORTHFLANK-API] Domain "${domain}" already exists in Northflank; continuing with assignment.`));
+                created = { id: domain, domain, name: domain, alreadyExists: true };
+            } else {
+                throw e;
             }
-        );
-        const result = data.customDomainCreate;
-        console.log(chalk.green(`[RAILWAY-API] ✓ Domain "${domain}" registered with Railway (ID: ${result.id})`));
+        }
+
+        let assigned = false;
+        try {
+            assigned = await assignDomainToNorthflank(domain);
+        } catch (e) {
+            console.error(chalk.yellow(`[NORTHFLANK-API] Domain "${domain}" was created but assignment to service port failed: ${e.message}`));
+        }
+
+        const resultDomain = created.domain || created.name || domain;
+        const result = {
+            ...created,
+            id: resultDomain,
+            domain: resultDomain,
+            assigned,
+        };
+        console.log(chalk.green(`[NORTHFLANK-API] ✓ Domain "${domain}" registered with Northflank${assigned ? ' and assigned' : ''} (ID: ${result.id})`));
         return result;
     } catch (e) {
-        console.error(chalk.red(`[RAILWAY-API] Failed to register "${domain}":`, e.message));
+        console.error(chalk.red(`[NORTHFLANK-API] Failed to register "${domain}":`, e.message));
         return null;
     }
 }
 
 /**
- * Unregister a custom domain from Railway.
- * @param {string} railwayDomainId - The Railway-assigned domain ID
+ * Unregister a custom domain from Northflank.
+ * @param {string} domainIdOrHostname - The Northflank domain identifier or hostname
  * @returns {Promise<boolean>} - true if successful
  */
-async function unregisterDomainFromRailway(railwayDomainId) {
-    if (!isRailwayApiConfigured() || !railwayDomainId) {
+async function unregisterDomainFromNorthflank(domainIdOrHostname) {
+    if (!isNorthflankApiConfigured() || !domainIdOrHostname) {
         return false;
     }
     try {
-        console.log(chalk.blue(`[RAILWAY-API] Removing domain ID "${railwayDomainId}" from Railway...`));
-        await railwayApiRequest(
-            `mutation($id: String!) { customDomainDelete(id: $id) }`,
-            { id: railwayDomainId }
-        );
-        console.log(chalk.green(`[RAILWAY-API] ✓ Domain removed from Railway.`));
+        console.log(chalk.blue(`[NORTHFLANK-API] Removing domain "${domainIdOrHostname}" from Northflank...`));
+        await northflankApiRequest('DELETE', `/v1/domains/${encodeURIComponent(domainIdOrHostname)}`);
+        console.log(chalk.green(`[NORTHFLANK-API] ✓ Domain removed from Northflank.`));
         return true;
     } catch (e) {
-        console.error(chalk.red(`[RAILWAY-API] Failed to remove domain:`, e.message));
+        if (e.statusCode === 404) {
+            console.log(chalk.yellow(`[NORTHFLANK-API] Domain "${domainIdOrHostname}" was already absent from Northflank.`));
+            return true;
+        }
+        console.error(chalk.red(`[NORTHFLANK-API] Failed to remove domain:`, e.message));
         return false;
     }
 }
@@ -330,6 +392,113 @@ app.use(async (req, res, next) => {
 // Static files AFTER the link domain gate — dashboard not served on link domain
 app.use(express.static(path.join(__dirname, '../public')));
 
+// ==================== ANTI-SCAN HARDENING ====================
+// Strict security headers for all tracking-domain responses to make the link
+// domain less appealing to scanners and reduce flagging risk.
+// Applied via middleware so every /tr/, /p/, /s/, /sr/ response carries them.
+app.use((req, res, next) => {
+    const p = req.path.toLowerCase();
+    // Only apply to tracking-style paths so dashboard endpoints keep their existing semantics.
+    if (p.startsWith('/tr/') || p.startsWith('/p/') || p.startsWith('/s/') || p.startsWith('/sr/')) {
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet, noimageindex');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), interest-cohort=(), browsing-topics=()');
+        // Use private no-store so intermediaries (Outlook safelink crawlers, Mimecast) don't cache the page
+        res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, proxy-revalidate');
+    }
+    next();
+});
+
+// ==================== ROBOTS.TXT (DISALLOW ALL ON LINK DOMAINS) ====================
+// Search engines and scanners often consult robots.txt before crawling. Returning
+// a strict "disallow everything" robots.txt on the link domain gives scanners a
+// legitimate signal that this is a private/restricted host and discourages
+// follow-up scans. Web (dashboard) domains keep default behavior.
+app.get('/robots.txt', (req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (isLinkDomainRequest(req)) {
+        return res.send('User-agent: *\nDisallow: /\n');
+    }
+    // Web/default — allow but block tracking paths
+    return res.send('User-agent: *\nDisallow: /tr/\nDisallow: /p/\nDisallow: /s/\nDisallow: /sr/\n');
+});
+
+// ==================== HONEYPOT / SCANNER PROBE PATHS ====================
+// Common paths that attackers and security scanners probe (looking for misconfigured
+// CMS installations, env files, or admin panels). Hitting any of these is a strong
+// indicator the request is automated. We respond with a benign 404 (not a redirect,
+// not a stack trace) so the scanner sees nothing interesting, and we record the IP
+// in an in-memory set so subsequent tracking hits from the same IP are pre-flagged.
+const HONEYPOT_PATHS = new Set([
+    '/wp-login.php', '/wp-admin', '/wp-admin/', '/wp-config.php',
+    '/.env', '/.env.local', '/.env.production', '/.git/config', '/.git/HEAD',
+    '/phpinfo.php', '/info.php', '/test.php',
+    '/admin.php', '/administrator', '/administrator/',
+    '/xmlrpc.php', '/wp-content/', '/wp-includes/',
+    '/.htaccess', '/.htpasswd', '/web.config',
+    '/config.json', '/config.yml', '/secrets.json',
+    '/.aws/credentials', '/.ssh/id_rsa',
+    '/server-status', '/server-info', '/.well-known/security.txt'
+]);
+
+// Track flagged scanner IPs (LRU-bounded). Exposed for botDetector via req-level marker.
+const _flaggedScannerIps = new Map(); // ip -> firstSeenTs
+const FLAGGED_IP_MAX = 10000;
+const FLAGGED_IP_TTL_MS = 24 * 60 * 60 * 1000;
+
+function _flagScannerIp(ip) {
+    if (!ip) return;
+    if (_flaggedScannerIps.size >= FLAGGED_IP_MAX) {
+        const oldest = _flaggedScannerIps.keys().next().value;
+        _flaggedScannerIps.delete(oldest);
+    }
+    _flaggedScannerIps.set(ip, Date.now());
+}
+function _isFlaggedScannerIp(ip) {
+    if (!ip) return false;
+    const ts = _flaggedScannerIps.get(ip);
+    if (!ts) return false;
+    if (Date.now() - ts > FLAGGED_IP_TTL_MS) {
+        _flaggedScannerIps.delete(ip);
+        return false;
+    }
+    return true;
+}
+
+// Periodic cleanup of stale honeypot entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, ts] of _flaggedScannerIps) {
+        if (now - ts > FLAGGED_IP_TTL_MS) _flaggedScannerIps.delete(ip);
+    }
+}, 60 * 60 * 1000).unref?.();
+
+// Mark request with honeypot flag for downstream handlers
+app.use((req, res, next) => {
+    const path = req.path.toLowerCase();
+    const ip = req.clientIp || req.ip;
+
+    if (HONEYPOT_PATHS.has(path) || path.startsWith('/wp-content/') || path.startsWith('/.git/')) {
+        _flagScannerIp(ip);
+        console.log(chalk.yellow(`[HONEYPOT] Scanner probe: ${path} from ${ip} (flagged)`));
+        // Serve a generic 404 — no useful info, no stack, no redirect
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        return res.status(404).send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not Found</title></head><body><h1>404</h1></body></html>');
+    }
+
+    // Decorate request so botDetector / fraud can use it
+    if (_isFlaggedScannerIp(ip)) {
+        req.headers['x-honeypot-flagged'] = '1';
+    }
+    next();
+});
+
+// Expose the flagged-scanner check for the dashboard analytics module
+app._flaggedScannerIps = _flaggedScannerIps;
+
 // ==================== COOKIE PARSER ====================
 function parseCookies(req) {
     const header = req.headers.cookie;
@@ -399,7 +568,7 @@ async function ensureDefaultUser() {
 ensureDefaultUser();
 
 // Middleware to verify JWT
-const authenticateToken = (req, res, next) => {
+const authenticateTokenJwt = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.sendStatus(401);
@@ -410,6 +579,11 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+// API-key-aware wrapper: tries `Authorization: Bearer rdr_…` against api_keys
+// first, falls through to JWT verification. Same downstream contract — populates
+// req.user with { id, user, role } so all existing routes work unchanged.
+const authenticateToken = apiKeyManager.makeApiKeyAwareAuth(authenticateTokenJwt);
 
 // Optional auth - attaches user if token present but doesn't require it
 const optionalAuth = (req, res, next) => {
@@ -535,7 +709,7 @@ async function getUserPreferredDomain(ownerId, reqHost) {
         }
 
         // No verified link domain and no LINK_DOMAIN configured — use the
-        // current request host (Railway hostname). This guarantees links
+        // current request host (Northflank hostname). This guarantees links
         // always resolve to a working server instead of a broken domain.
     } catch (e) {
         console.error('Error fetching custom domain:', e);
@@ -635,23 +809,58 @@ async function detectBotAndGeo(req) {
  * Generates the client-side unlock script with encrypted payload.
  * This is the JavaScript blob injected into the template page.
  */
-function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
+function buildUnlockScript(linkId, encryptedPayload, challengeToken, profile) {
     const payloadSafe = JSON.stringify(encryptedPayload)
         .replace(/\\/g, '\\\\')
         .replace(/"/g, '\\"')
         .replace(/'/g, "\\'");
 
+    // Read fallback URL from config and prepare for safe JS embedding
+    const fallbackUrl = (config.redirector && config.redirector.fallbackUrl) || 'https://www.google.com';
+    const fallbackSafe = String(fallbackUrl).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+    // Randomize identifier names so each served HTML differs (anti-template fingerprint).
+    // Uses `crypto.randomInt` (unbiased) rather than `randomBytes() % alphabet.length`.
+    const _crypto = require('crypto');
+    const rnd = (n) => {
+        const a = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        let s = '';
+        for (let i = 0; i < n; i++) s += a[_crypto.randomInt(0, a.length)];
+        return '_' + s;
+    };
+    const noiseId = rnd(10).slice(1);
+    // Feature 19: cloaker preset profiles (Fast / Balanced / Stealth). When
+    // a link has no profile set, the helper returns the existing "Balanced"
+    // defaults — zero behavior change.
+    const preset = featuresExtra.getCloakerProfile(profile);
+    const submitJitter = preset.jitterMin + Math.floor(Math.random() * Math.max(1, (preset.jitterMax - preset.jitterMin)));
+    const REDIRECT_DELAY_BASELINE_MS = preset.redirectDelayMs;
+    const REDIRECT_DELAY_MIN_MS = 1000;
+    const REDIRECT_DELAY_MAX_MS = 30000;
+
     return `
-<script data-system-unlock="true">
+<script data-system-unlock="${noiseId}">
 (function() {
     'use strict';
     
     var P = JSON.parse("${payloadSafe}");
     var LID = "${linkId}";
     var CT = "${challengeToken}";
+    var FB = "${fallbackSafe}";
     var hasSubmitted = false;
-    
-    // Client-Side Bot Detection (Hardened v2 — scoring-based)
+    var hasInteraction = false;
+
+    // Track human interaction passively
+    function _onMove() { hasInteraction = true; }
+    try {
+        document.addEventListener('mousemove', _onMove, { passive: true, once: true });
+        document.addEventListener('pointermove', _onMove, { passive: true, once: true });
+        document.addEventListener('touchstart', _onMove, { passive: true, once: true });
+        document.addEventListener('keydown', _onMove, { passive: true, once: true });
+        document.addEventListener('scroll', _onMove, { passive: true, once: true });
+    } catch (e) { /* ignore */ }
+
+    // Client-Side Bot Detection (Hardened v3 — scoring-based with WebGL/timezone/iframe checks)
     function checkBot() {
         var s = 0;
         if (navigator.webdriver) s += 100;
@@ -663,6 +872,12 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         try { if (typeof Notification === 'undefined') s += 25; } catch(e) { s += 25; }
         if (screen.width === 0 || screen.height === 0) s += 80;
         if (screen.colorDepth && screen.colorDepth < 8) s += 40;
+        try { if (navigator.hardwareConcurrency === 0) s += 30; } catch(e) {}
+        try {
+            var tz = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || '';
+            if (!tz) s += 30;
+        } catch(e) { s += 30; }
+        try { if (window.top !== window.self) s += 50; } catch(e) { s += 50; }
         try {
             var cv = document.createElement('canvas');
             var cx = cv.getContext('2d');
@@ -674,10 +889,19 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             }
         } catch(e) { s += 60; }
         try {
-            var gl = document.createElement('canvas').getContext('webgl');
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
             if (!gl) s += 20;
+            else {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    var rend = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').toLowerCase();
+                    if (rend.indexOf('swiftshader') !== -1 || rend.indexOf('llvmpipe') !== -1) s += 60;
+                }
+            }
         } catch(e) { s += 20; }
         if (navigator.userAgent.indexOf('Chrome') !== -1 && !window.chrome) s += 40;
+        try { if (!(window.AudioContext || window.webkitAudioContext)) s += 20; } catch(e) { s += 20; }
         return s >= 50;
     }
 
@@ -687,6 +911,7 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             webdriver: !!navigator.webdriver,
             headless: navigator.userAgent.indexOf('HeadlessChrome') !== -1,
             jsExecuted: true,
+            hasInteraction: hasInteraction,
             languages: navigator.languages ? navigator.languages.length : 0,
             plugins: navigator.plugins ? navigator.plugins.length : -1,
             touchSupport: 'ontouchstart' in window,
@@ -694,8 +919,15 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             screenH: screen.height || 0,
             colorDepth: screen.colorDepth || 0,
             deviceMemory: navigator.deviceMemory || 0,
-            hardwareConcurrency: navigator.hardwareConcurrency || 0
+            hardwareConcurrency: navigator.hardwareConcurrency || 0,
+            iframed: false,
+            timezone: '',
+            audioCtx: false,
+            webglRenderer: ''
         };
+        try { s.iframed = window.top !== window.self; } catch (e) { s.iframed = true; }
+        try { s.timezone = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || ''; } catch(e) {}
+        try { s.audioCtx = !!(window.AudioContext || window.webkitAudioContext); } catch(e) {}
         try {
             var c = document.createElement('canvas');
             var ctx = c.getContext('2d');
@@ -706,9 +938,17 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             ctx.fillStyle = '#069';
             ctx.fillText('Test', 2, 15);
             s.canvasHash = c.toDataURL().length;
-        } catch(e) {
-            s.canvasHash = 0;
-        }
+        } catch(e) { s.canvasHash = 0; }
+        try {
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
+            if (gl) {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    s.webglRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').slice(0, 96);
+                }
+            }
+        } catch(e) {}
         return JSON.stringify(s);
     }
 
@@ -717,7 +957,9 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         
         if (checkBot()) {
             if (window.__sys_ops && window.__sys_ops.replace) {
-                window.__sys_ops.replace("https://www.google.com");
+                window.__sys_ops.replace(FB);
+            } else {
+                window.location.replace(FB);
             }
             return;
         }
@@ -732,6 +974,7 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             },
+            credentials: 'same-origin',
             body: JSON.stringify({
                 payload: JSON.stringify(P),
                 lid: LID,
@@ -762,9 +1005,10 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
             }
         })
         .catch(function(err) {
-            console.error("Unlock failed", err);
             if (window.__sys_ops && window.__sys_ops.replace) {
-                window.__sys_ops.replace("https://google.com");
+                window.__sys_ops.replace(FB);
+            } else {
+                window.location.replace(FB);
             }
         });
     }
@@ -774,16 +1018,32 @@ function buildUnlockScript(linkId, encryptedPayload, challengeToken) {
         submitUnlock(); // Immediate submission
     });
 
-    // Auto-submit with a delay if it's a non-interactive template (e.g. just a loading bar)
-    // The delay lets the template display properly before the server-controlled redirect
-    // The "system-captcha-wrapper" class comes from the htmlTemplateProcessor
+    // Auto-submit with a randomised delay if it's a non-interactive template (e.g. just a loading bar).
+    // Total delay: baseline (${REDIRECT_DELAY_BASELINE_MS}ms) + submitJitter (600-1500ms) → ~4.6-5.5s.
+    // Templates may opt-in to a custom delay via <meta name="x-redirect-delay" content="ms">,
+    // clamped to [${REDIRECT_DELAY_MIN_MS}, ${REDIRECT_DELAY_MAX_MS}] ms.
     if (document.querySelector('.system-captcha-wrapper') === null) {
         var safeTimeout = (window.__sys_ops && window.__sys_ops.setTimeout) ? window.__sys_ops.setTimeout : setTimeout;
-        function delayedSubmit() { safeTimeout(submitUnlock, 3000); }
-        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        // Allow the template to declare its preferred render time.
+        var customDelay = 0;
+        try {
+            var meta = document.querySelector('meta[name="x-redirect-delay"]');
+            if (meta) {
+                var v = parseInt(meta.getAttribute('content'), 10);
+                if (isFinite(v) && v > 0) {
+                    customDelay = Math.min(Math.max(v, ${REDIRECT_DELAY_MIN_MS}), ${REDIRECT_DELAY_MAX_MS});
+                }
+            }
+        } catch (e) { /* ignore parsing errors */ }
+        var totalDelay = customDelay > 0 ? customDelay : (${REDIRECT_DELAY_BASELINE_MS} + ${submitJitter});
+        function delayedSubmit() { safeTimeout(submitUnlock, totalDelay); }
+        // Wait for the full template (HTML + images/fonts/subresources) to finish
+        // rendering before starting the redirect countdown, so visitors see the
+        // template content completely before the redirect fires.
+        if (document.readyState === 'complete') {
             delayedSubmit();
         } else {
-            document.addEventListener('DOMContentLoaded', delayedSubmit);
+            window.addEventListener('load', delayedSubmit, { once: true });
         }
     }
 })();
@@ -803,11 +1063,16 @@ async function buildCloakedPage(req, link, linkId, country, selectedDestinationU
     });
 
     // B. Process template - CRITICAL: injectRedirect = false
+    const ipForHash = req.clientIp || req.ip || '';
     const { html: processedHtml } = processTemplate(rawTemplate, {
         destinationUrl: '#', // Don't expose real URL in template tokens
         linkId: linkId,
         country: country,
         domain: req.get('host'),
+        // Feature 17: visitor-context tokens. Hashed IP keeps it GDPR-safe.
+        userAgent: req.headers['user-agent'] || '',
+        referrer: req.headers['referer'] || req.headers['referrer'] || '',
+        ipHash: featuresExtra.hashIp(ipForHash, JWT_SECRET),
         injectRedirect: false // CRITICAL: Disable processor's redirect to use our secure unlock
     });
 
@@ -821,8 +1086,8 @@ async function buildCloakedPage(req, link, linkId, country, selectedDestinationU
         { expiresIn: '3m' }
     );
 
-    // E. Build the unlock script
-    const unlockScript = buildUnlockScript(linkId, encrypted, challengeToken);
+    // E. Build the unlock script — applies the link's cloaker preset (Feature 19)
+    const unlockScript = buildUnlockScript(linkId, encrypted, challengeToken, link.cloakerProfile);
 
     // F. Inject the unlock script at the end of body
     let finalHtml = processedHtml;
@@ -858,12 +1123,60 @@ async function handleTrackingHit(req, res, linkId) {
             return res.status(410).send('This link is currently paused');
         }
 
+        // 1c. Check if link has expired (expiresAt is optional, NULL means never expires)
+        if (link.expiresAt) {
+            const now = new Date();
+            const expiryDate = new Date(link.expiresAt);
+            if (now > expiryDate) {
+                console.log(chalk.yellow(`[TRACKING] Link expired: ${linkId} (expired at ${link.expiresAt})`));
+                return res.status(404).send(LINK_DOMAIN_404_PAGE);
+            }
+        }
+
+        // 1d. Click cap (Feature 1) — humans-only count, returns 404 page when reached.
+        // Bot probes do not consume the cap (they're filtered out via getNextRotationUrl flow).
+        if (featuresExtra.isClickCapReached(link)) {
+            console.log(chalk.yellow(`[TRACKING] Link click cap reached: ${linkId}`));
+            return res.status(404).send(LINK_DOMAIN_404_PAGE);
+        }
+
+        // 1e. Active hours window (Feature 7) — outside window → fallback URL
+        if (!featuresExtra.isWithinActiveHours(link)) {
+            const fallback = (config.redirector && config.redirector.fallbackUrl) || 'https://www.google.com';
+            console.log(chalk.yellow(`[TRACKING] Outside active hours for ${linkId}, redirecting to fallback`));
+            return res.redirect(302, fallback);
+        }
+
+        // NOTE: Single-use enforcement is intentionally moved to AFTER bot detection.
+        // The single-use restriction applies ONLY to bots/crawlers — real humans can
+        // access the link an unlimited number of times. See step 4 below.
+
         // 2. Bot detection + Geo lookup (extracted helper)
         const { isBot, botResult, country } = await detectBotAndGeo(req);
-        
-        // 3. Get the ACTUAL destination URL — select from rotations if available
-        const destinationUrl = await linkStore.getNextRotationUrl(linkId, link.destinationUrlDesktop);
-        
+
+        // 3. Get the ACTUAL destination URL — select from rotations if available.
+        // Feature 3: per-destination geo / device / ASN / hours rules. If no
+        // rotation matches the current visitor, falls back to the unfiltered
+        // weighted selection (zero behavior change for existing links).
+        let destinationUrl;
+        try {
+            const rotations = await linkStore.getRotationsForLink(linkId);
+            if (rotations && rotations.length > 0) {
+                const geo = geoip.lookup(ip) || {};
+                const ctx = {
+                    country: country,
+                    device: featuresExtra.classifyDevice(uaString),
+                    asn: geo.org || ''
+                };
+                const picked = featuresExtra.pickRotationWithRules(rotations, ctx);
+                destinationUrl = picked ? picked.url : link.destinationUrlDesktop;
+            } else {
+                destinationUrl = link.destinationUrlDesktop;
+            }
+        } catch (e) {
+            destinationUrl = await linkStore.getNextRotationUrl(linkId, link.destinationUrlDesktop);
+        }
+
         if (!destinationUrl) {
             console.log(chalk.red(`[TRACKING] No destination URL for link:  ${linkId}`));
             return res.status(404).send('Link destination not configured');
@@ -872,10 +1185,27 @@ async function handleTrackingHit(req, res, linkId) {
         // 4. Handle Response - Redirect bots into safe unlimited redirect chain
         if (isBot) {
             console.log(chalk.yellow(`[TRACKING] Bot detected (${botResult.score}) - redirecting into safe chain`));
-            
+
+            // 4a. Single-use enforcement (BOT-ONLY): if this link is marked single-use
+            // and a bot has already touched it, return 410 Gone for all subsequent bot
+            // probes. This defeats scanner replay/probing while keeping the link fully
+            // accessible to real humans (humans never reach this branch).
+            if (link.singleUse === 1 && link.usedAt) {
+                console.log(chalk.yellow(`[TRACKING] Single-use link: blocking subsequent bot probe (first bot at ${link.usedAt})`));
+                // Still log the bot probe for analytics
+                try {
+                    await linkStore.logClick({
+                        linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+                        botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
+                    });
+                } catch (e) { /* non-fatal */ }
+                return res.status(410).send('Gone');
+            }
+
             // Log the initial bot hit
             await linkStore.logClick({
-                linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl
+                linkId, isBot: true, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+                botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
             });
 
             // Log bot redirect event
@@ -887,6 +1217,21 @@ async function handleTrackingHit(req, res, linkId) {
                 );
             } catch (e) {
                 console.warn(chalk.yellow('[TRACKING] Failed to log bot redirect event:', e.message));
+            }
+
+            // 4b. Mark single-use link as "consumed by a bot" — only for the FIRST bot.
+            // Subsequent bot probes are blocked at 4a above. Humans never trigger this.
+            if (link.singleUse === 1 && !link.usedAt) {
+                try {
+                    const db = await getDb();
+                    await db.run(
+                        'UPDATE links SET usedAt = CURRENT_TIMESTAMP WHERE id = ? AND usedAt IS NULL',
+                        [linkId]
+                    );
+                    console.log(chalk.cyan(`[TRACKING] Single-use link consumed by first bot: ${linkId}`));
+                } catch (e) {
+                    console.warn(chalk.yellow(`[TRACKING] Failed to mark single-use link: ${e.message}`));
+                }
             }
 
             // Start the safe redirect chain — bot enters an infinite loop of safe pages
@@ -914,15 +1259,64 @@ async function handleTrackingHit(req, res, linkId) {
             }
         }
 
+        // 5b. PIN gate (Feature 2). Real-human-only — bots already exited above.
+        // The PIN cookie is a JWT signed with JWT_SECRET so it can't be forged.
+        // Keeping the gate AFTER bot detection means scanners never see the prompt.
+        if (link.accessPin) {
+            const pinCookieName = `tr_pin_${linkId}`;
+            const pinToken = cookies[pinCookieName];
+            let pinOk = false;
+            if (pinToken) {
+                try {
+                    const decoded = jwt.verify(pinToken, JWT_SECRET);
+                    pinOk = decoded && decoded.lid === linkId && decoded.t === 'pin';
+                } catch (e) { pinOk = false; }
+            }
+            if (!pinOk) {
+                console.log(chalk.cyan(`[TRACKING] PIN required for link ${linkId} — serving gate`));
+                res.setHeader('Content-Type', 'text/html; charset=utf-8');
+                res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+                return res.status(200).send(featuresExtra.renderPinGatePage(linkId));
+            }
+        }
+
         // 6. Log to Database
         await linkStore.logClick({
-            linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl
+            linkId, isBot, ipAddress: ip, userAgent: uaString, country, referrer: referer, destinationUrl: destinationUrl,
+            botScore: botResult.score, botConfidence: botResult.confidence, botSignals: botResult.signals
         });
+
+        // 6b. Webhook on click (Feature 6). Fire-and-forget; never blocks redirect.
+        try {
+            const db = await getDb();
+            const owner = await db.get('SELECT webhookUrl FROM users WHERE id = ?', [link.ownerId]);
+            const webhookUrl = link.webhookUrl || (owner && owner.webhookUrl);
+            if (webhookUrl) {
+                featuresExtra.fireClickWebhook({
+                    url: webhookUrl,
+                    secret: JWT_SECRET,
+                    payload: {
+                        type: 'click',
+                        linkId, isBot, country, timestamp: Date.now(),
+                        userAgent: uaString,
+                        botScore: botResult.score
+                    },
+                    linkId, ownerId: link.ownerId
+                });
+            }
+        } catch (e) { /* non-fatal */ }
+
+        // NOTE: Single-use links are NOT marked when a human clicks. Humans always
+        // have unlimited access. The `usedAt` timestamp is only set when the FIRST
+        // bot probe is detected (see step 4b above), which then blocks all subsequent
+        // bot probes while leaving the link fully open for real users.
 
         // 7. WebSocket Broadcast
         if (link.ownerId) {
             broadcastToUser(link.ownerId, 'LIVE_CLICK', {
-                linkId, isBot, clickType: isBot ? 'bot' : 'human', country, timestamp: Date.now(), ipAddress: ip, score: botResult.score
+                linkId, isBot, clickType: isBot ? 'bot' : 'human', country, timestamp: Date.now(), ipAddress: ip,
+                score: botResult.score, confidence: botResult.confidence, signals: botResult.signals,
+                userAgent: uaString
             });
         }
 
@@ -946,6 +1340,47 @@ async function handleTrackingHit(req, res, linkId) {
 
 // ==================== UNLOCK ROUTE (POST) - HARDENED ====================
 const unlockLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+
+// ==================== PIN GATE ENDPOINT (Feature 2) ====================
+// Validates the user-supplied PIN against the link's bcrypt hash and, on
+// success, sets a short-lived signed cookie (tr_pin_<linkId>) that the main
+// tracking handler checks on the next request. Reuses unlockLimiter for
+// rate-limiting (consistent with other unlock endpoints).
+const PIN_COOKIE_TTL_SECONDS = 600; // 10 minutes
+app.post('/tr/v2/pin', unlockLimiter, express.json(), async (req, res) => {
+    try {
+        const { lid, pin } = req.body || {};
+        if (!lid || !pin) {
+            return res.status(400).json({ error: 'Missing PIN or link id.' });
+        }
+        const link = await linkStore.getLink(lid);
+        if (!link || !link.accessPin) {
+            return res.status(404).json({ error: 'Link not found or no PIN required.' });
+        }
+        // Reject expired / capped / out-of-hours links here too — defense in depth
+        if (link.expiresAt && new Date() > new Date(link.expiresAt)) {
+            return res.status(410).json({ error: 'This link has expired.' });
+        }
+        if (featuresExtra.isClickCapReached(link)) {
+            return res.status(410).json({ error: 'This link has reached its limit.' });
+        }
+        const ok = await featuresExtra.verifyAccessPin(pin, link.accessPin);
+        if (!ok) {
+            return res.status(401).json({ error: 'Incorrect access code.' });
+        }
+        const token = jwt.sign({ lid, t: 'pin', ts: Date.now() }, JWT_SECRET, { expiresIn: `${PIN_COOKIE_TTL_SECONDS}s` });
+        const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+        const cookie = `tr_pin_${encodeURIComponent(lid)}=${token}; Max-Age=${PIN_COOKIE_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Lax${isHttps ? '; Secure' : ''}`;
+        res.setHeader('Set-Cookie', cookie);
+        // The browser then re-fetches the original tracking URL, which now
+        // sees the cookie and proceeds into the cloaker flow.
+        return res.json({ success: true, next: `/tr/v1/${encodeURIComponent(lid)}` });
+    } catch (e) {
+        console.error(chalk.red('[PIN]'), e.message);
+        return res.status(500).json({ error: 'Internal error.' });
+    }
+});
+
 app.post('/tr/v2/unlock', unlockLimiter, async (req, res) => {
     try {
         const payloadString = req.body.payload;
@@ -1017,7 +1452,7 @@ app.post('/tr/v2/unlock', unlockLimiter, async (req, res) => {
         // 2. Validate the destination URL is not our own tracking URL (prevent loops)
         if (destinationUrl.includes('/tr/v1/') || destinationUrl.includes('/tr/v2/') || destinationUrl.includes('/p/')) {
             console.log(chalk.red('[UNLOCK] Loop detected - destination points back to tracking URL'));
-            return res.redirect('https://google.com');
+            return res.redirect(config.redirector.fallbackUrl || 'https://google.com');
         }
 
         // 3. Double-Check Bot Detection (Server Side) - STRICT EDGE BLOCKING
@@ -1229,6 +1664,10 @@ app.get('/s/:slug', async (req, res) => {
             linkId: shortLinkId,
             country: country,
             domain: req.get('host'),
+            // Feature 17 tokens
+            userAgent: req.headers['user-agent'] || '',
+            referrer: req.headers['referer'] || req.headers['referrer'] || '',
+            ipHash: featuresExtra.hashIp(ip, JWT_SECRET),
             injectRedirect: false // CRITICAL: Use our secure unlock flow instead
         });
 
@@ -1264,6 +1703,30 @@ app.get('/s/:slug', async (req, res) => {
 // ==================== API ROUTES ====================
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
 const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+
+// ==================== EXTRA FEATURE ROUTES ====================
+// Mounted BEFORE the existing /api/* routes so that the new public endpoints
+// (/api/templates/public, /api/templates/tokens-extended, etc.) win the
+// route-match against shadowing wildcards like /api/templates/:name.
+// Routes registered here:
+//   GET  /api/short-links/:slug/qr.svg          (Feature 4)
+//   GET  /api/links/:id/qr.svg                  (Feature 4)
+//   GET/POST template revisions + restore       (Feature 9)
+//   CRUD for /api/api-keys                      (Feature 11)
+//   GET  /api/stats/click-heatmap               (Feature 12)
+//   GET  /api/stats/conversion-funnel           (Feature 12)
+//   POST /api/links/:id/share + GET /pub/stats  (Feature 14)
+//   GET  /api/templates/public + clone/visibility (Feature 15)
+//   GET  /api/templates/tokens-extended         (Feature 17)
+//   GET  /api/links/trash + POST restore        (Feature 18)
+//   GET  /api/cloaker-presets                   (Feature 19)
+//   GET  /api/account/export, POST /import      (Feature 20)
+app.use(buildExtraRouter({
+    authenticateToken,
+    apiLimiter,
+    getUserPreferredDomain,
+    getJwtSecret: () => JWT_SECRET
+}));
 
 // --- Initial Setup Endpoints (for first-time admin key retrieval) ---
 app.get('/api/setup/status', authLimiter, async (req, res) => {
@@ -1327,13 +1790,28 @@ app.post('/api/auth/admin-email', authLimiter, async (req, res) => {
 });
 
 app.post('/api/admin/generate-key', authLimiter, authenticateToken, async (req, res) => {
-    const { targetEmail } = req.body;
+    const { targetEmail, expiresInDays } = req.body;
     try {
         if (req.user.user !== config.adminEmail) {
             return res.status(403).json({ error: 'Forbidden: Only the admin can generate access keys.' });
         }
-        const result = await auth.generateAccessKey(req.user.user, targetEmail);
-        res.json({ accessKey: result.accessKey, expiresAt: result.expiresAt });
+        // Validate expiresInDays if provided — must be a finite positive number ≤ 3650.
+        // Pass through to auth.generateAccessKey which performs the same clamp; we
+        // duplicate the surface check here to give a 400 response (rather than a
+        // silently clamped value) for obviously bogus input.
+        let days;
+        if (expiresInDays !== undefined && expiresInDays !== null && expiresInDays !== '') {
+            days = Number(expiresInDays);
+            if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+                return res.status(400).json({ error: 'expiresInDays must be a number between 1 and 3650.' });
+            }
+        }
+        const result = await auth.generateAccessKey(req.user.user, targetEmail, days);
+        res.json({
+            accessKey: result.accessKey,
+            expiresAt: result.expiresAt,
+            expiresInDays: result.expiresInDays
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1372,7 +1850,14 @@ app.post('/api/links/bulk-delete', apiLimiter, authenticateToken, async (req, re
 // ==================== FIXED: POST /api/links (WITH DOMAIN PRIORITIZATION) ====================
 app.post('/api/links', authenticateToken, async (req, res) => {
     try {
-        const { rotations, expiresAt, customDomain, templateId } = req.body;
+        const {
+            rotations, expiresAt, customDomain, templateId, singleUse,
+            // Feature 1, 2, 7, 19 — optional fields applied AFTER link creation.
+            // Validation matches PATCH /api/links/:id/settings.
+            maxClicks, accessPin, webhookUrl,
+            activeFromHour, activeToHour, activeTimezone,
+            cloakerProfile
+        } = req.body;
         
         // 1. Determine the base domain to use
         let publicDomain = customDomain;
@@ -1396,9 +1881,48 @@ app.post('/api/links', authenticateToken, async (req, res) => {
             publicDomain: publicDomain,
             expiresAt,
             rotations,
-            templateId: templateId || undefined
+            templateId: templateId || undefined,
+            singleUse: singleUse || false
         });
-        
+
+        // 5. Apply optional per-link settings (Features 1, 2, 6, 7, 19) by
+        // building a follow-up UPDATE. These are intentionally additive — if
+        // none are supplied, behavior is unchanged from before.
+        try {
+            const linkId = result && (result.id || (result.link && result.link.id));
+            if (linkId) {
+                const updates = [];
+                const values = [];
+                if (maxClicks != null && maxClicks !== '') {
+                    const n = Number(maxClicks);
+                    if (Number.isFinite(n) && n >= 0 && n <= 1e9) { updates.push('maxClicks = ?'); values.push(Math.floor(n)); }
+                }
+                if (accessPin) {
+                    try {
+                        const hash = await featuresExtra.hashAccessPin(accessPin);
+                        updates.push('accessPin = ?'); values.push(hash);
+                    } catch (e) { /* ignore invalid PIN — link still created */ }
+                }
+                if (webhookUrl && /^https?:\/\//i.test(String(webhookUrl))) {
+                    updates.push('webhookUrl = ?'); values.push(String(webhookUrl).trim());
+                }
+                const validHour = h => h == null || h === '' || (Number.isInteger(Number(h)) && Number(h) >= 0 && Number(h) <= 23);
+                if (validHour(activeFromHour) && validHour(activeToHour)) {
+                    if (activeFromHour != null && activeFromHour !== '') { updates.push('activeFromHour = ?'); values.push(Number(activeFromHour)); }
+                    if (activeToHour   != null && activeToHour   !== '') { updates.push('activeToHour = ?');   values.push(Number(activeToHour)); }
+                    if (activeTimezone) { updates.push('activeTimezone = ?'); values.push(String(activeTimezone).slice(0, 64)); }
+                }
+                if (cloakerProfile && Object.keys(featuresExtra.CLOAKER_PRESETS).includes(String(cloakerProfile).toLowerCase())) {
+                    updates.push('cloakerProfile = ?'); values.push(String(cloakerProfile).toLowerCase());
+                }
+                if (updates.length > 0) {
+                    const db = await getDb();
+                    values.push(linkId);
+                    await db.run(`UPDATE links SET ${updates.join(', ')} WHERE id = ?`, values);
+                }
+            }
+        } catch (e) { /* non-fatal — link is still created */ }
+
         res.json(result);
     } catch (err) { 
         console.error(chalk.red('[LINK-GEN] Error:'), err.message);
@@ -1481,7 +2005,7 @@ ${linkRows}
 
 app.post('/api/links/batch', apiLimiter, authenticateToken, async (req, res) => {
     try {
-        const { destinations, expiresAt, customDomain, templateId } = req.body;
+        const { destinations, expiresAt, customDomain, templateId, singleUse } = req.body;
 
         if (!destinations || !Array.isArray(destinations) || destinations.length === 0) {
             return res.status(400).json({ error: 'destinations must be a non-empty array of objects with a "url" property.' });
@@ -1517,7 +2041,8 @@ app.post('/api/links/batch', apiLimiter, authenticateToken, async (req, res) => 
             publicDomain,
             expiresAt,
             destinations,
-            templateId: templateId || undefined
+            templateId: templateId || undefined,
+            singleUse: singleUse || false
         });
 
         console.log(chalk.green(`[BATCH-GEN] ✓ Batch ${result.batchId}: ${result.links.length} links created`));
@@ -1682,6 +2207,42 @@ app.get('/api/stats/rate-summary', apiLimiter, authenticateToken, async (req, re
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ==================== BOT FEED / HUMAN FEED / THREATS / DOMAIN HEALTH ====================
+// Powering the dashboard "Bot Feed", "Human Conversions", "Top Threats", and
+// "Domain Health" panels. All endpoints require authentication and only return
+// data scoped to the requesting user.
+app.get('/api/analytics/bot-feed', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 100;
+        const feed = await linkStore.getBotFeed(req.user.id, limit);
+        res.json(feed);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/human-feed', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 100;
+        const feed = await linkStore.getHumanFeed(req.user.id, limit);
+        res.json(feed);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/threats/top', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days, 10) || 7;
+        const threats = await linkStore.getTopThreats(req.user.id, days);
+        res.json(threats);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/analytics/domain-health', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days, 10) || 1;
+        const health = await linkStore.getDomainHealth(req.user.id, days);
+        res.json(health);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==================== BOT REDIRECT CHAIN ANALYTICS ====================
 // Returns statistics about bot redirect chain activity for the user's links.
 app.get('/api/stats/bot-chains', apiLimiter, authenticateToken, async (req, res) => {
@@ -1774,35 +2335,35 @@ app.get('/api/domains', apiLimiter, authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Railway API status — lets the frontend know if auto-registration is available
-app.get('/api/railway-status', apiLimiter, authenticateToken, (req, res) => {
-    res.json({ configured: isRailwayApiConfigured() });
+// Northflank API status — lets the frontend know if auto-registration is available
+app.get('/api/northflank-status', apiLimiter, authenticateToken, (req, res) => {
+    res.json({ configured: isNorthflankApiConfigured() });
 });
 
-// Manual Railway registration — for domains that were added before RAILWAY_TOKEN was set,
+// Manual Northflank registration — for domains that were added before NORTHFLANK_API_TOKEN was set,
 // or when auto-registration failed and the user wants to retry.
-app.post('/api/domains/:id/railway-register', apiLimiter, authenticateToken, async (req, res) => {
+app.post('/api/domains/:id/northflank-register', apiLimiter, authenticateToken, async (req, res) => {
     try {
-        if (!isRailwayApiConfigured()) {
+        if (!isNorthflankApiConfigured()) {
             return res.status(400).json({
-                error: 'Railway API not configured. Set RAILWAY_TOKEN environment variable in your Railway service settings.',
+                error: 'Northflank API not configured. Set NORTHFLANK_API_TOKEN environment variable in your Northflank service settings.',
                 needsToken: true,
             });
         }
         const db = await getDb();
-        const domain = await db.get('SELECT id, hostname, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        const domain = await db.get('SELECT id, hostname, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
-        if (domain.railwayDomainId) {
-            return res.json({ success: true, alreadyRegistered: true, railwayDomainId: domain.railwayDomainId });
+        if (domain.northflankDomainId) {
+            return res.json({ success: true, alreadyRegistered: true, northflankDomainId: domain.northflankDomainId });
         }
 
-        const railwayResult = await registerDomainWithRailway(domain.hostname);
-        if (railwayResult && railwayResult.id) {
-            await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayResult.id, domain.id]);
-            res.json({ success: true, railwayDomainId: railwayResult.id });
+        const northflankResult = await registerDomainWithNorthflank(domain.hostname);
+        if (northflankResult && northflankResult.id) {
+            await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankResult.id, domain.id]);
+            res.json({ success: true, northflankDomainId: northflankResult.id });
         } else {
-            res.status(500).json({ error: 'Railway API call failed. Check server logs for details.' });
+            res.status(500).json({ error: 'Northflank API call failed. Check server logs for details.' });
         }
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1822,23 +2383,23 @@ app.post('/api/domains', apiLimiter, authenticateToken, async (req, res) => {
         // Refresh the domain gate caches so the new domain takes effect immediately
         await refreshAllDomainCaches();
 
-        // Auto-register with Railway if API credentials are configured
-        let railwayRegistered = false;
-        let railwayDomainId = null;
-        if (isRailwayApiConfigured()) {
-            const railwayResult = await registerDomainWithRailway(hostname);
-            if (railwayResult && railwayResult.id) {
-                railwayRegistered = true;
-                railwayDomainId = railwayResult.id;
-                await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayDomainId, result.lastID]);
+        // Auto-register with Northflank if API credentials are configured
+        let northflankRegistered = false;
+        let northflankDomainId = null;
+        if (isNorthflankApiConfigured()) {
+            const northflankResult = await registerDomainWithNorthflank(hostname);
+            if (northflankResult && northflankResult.id) {
+                northflankRegistered = true;
+                northflankDomainId = northflankResult.id;
+                await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankDomainId, result.lastID]);
             }
         }
 
         res.json({
             id: result.lastID, hostname, purpose, templateId: null,
             dnsVerified: 0, sslStatus: 'pending',
-            railwayRegistered,
-            railwayApiConfigured: isRailwayApiConfigured(),
+            northflankRegistered,
+            northflankApiConfigured: isNorthflankApiConfigured(),
         });
     } catch(e) { res.status(400).json({ error: 'Domain already exists' }); }
 });
@@ -1908,7 +2469,7 @@ function isCloudflareIp(ip) {
 }
 
 // Resolve the correct CNAME target — the hosting platform hostname, NOT a custom domain.
-// Custom domains must CNAME to the platform hostname (e.g., *.up.railway.app) to avoid
+// Custom domains must CNAME to the platform hostname (e.g., *.code.run) to avoid
 // Cloudflare Error 1000 caused by CNAMEing to another Cloudflare-proxied custom domain.
 function getCnameTarget(req) {
     // Priority 1: Explicit CNAME_TARGET env var — always trusted (user set it manually)
@@ -1916,30 +2477,30 @@ function getCnameTarget(req) {
         return config.cnameTarget;
     }
 
-    // Priority 2: RAILWAY_PUBLIC_DOMAIN, but ONLY if it looks like a platform hostname.
-    // Railway may set this to a custom domain (e.g., autismarmoset.com) which must NOT be
+    // Priority 2: NORTHFLANK_PUBLIC_DOMAIN, but ONLY if it looks like a platform hostname.
+    // Northflank may set this to a custom domain (e.g., autismarmoset.com) which must NOT be
     // used as a CNAME target — otherwise link domains would CNAME to the web domain,
     // causing Cloudflare Error 1000 and broken links.
-    if (config.railwayHostname && config.railwayHostname.endsWith('.railway.app')) {
-        return config.railwayHostname;
+    if (config.northflankHostname && config.northflankHostname.endsWith('.code.run')) {
+        return config.northflankHostname;
     }
 
-    // Priority 3: Request host if it's a Railway hostname (direct access via platform URL)
+    // Priority 3: Request host if it's a Northflank hostname (direct access via platform URL)
     const host = (req.get('host') || '').split(':')[0]; // Strip port
-    if (host.endsWith('.railway.app')) {
+    if (host.endsWith('.code.run')) {
         return host;
     }
 
     // Fallback: generic placeholder — user must set CNAME_TARGET env var
-    return 'your-app.up.railway.app';
+    return 'your-service.code.run';
 }
 
 app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req, res) => {
     try {
         const db = await getDb();
-        // Include purpose (link vs web) and railwayDomainId for purpose-aware checks
-        // and to avoid re-registering domains that already have a Railway domain ID.
-        const domain = await db.get('SELECT id, hostname, purpose, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        // Include purpose (link vs web) and northflankDomainId for purpose-aware checks
+        // and to avoid re-registering domains that already have a Northflank domain ID.
+        const domain = await db.get('SELECT id, hostname, purpose, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
         const dnsP = dns.promises;
@@ -1965,7 +2526,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
         // --- Cloudflare proxy-aware DNS verification ---
         // When Cloudflare proxy (orange cloud) is ON, resolveCname() returns nothing
         // and resolve4() returns Cloudflare proxy IPs. This is the CORRECT setup for
-        // domains whose origin (e.g. Railway) also uses Cloudflare infrastructure.
+        // domains whose origin (e.g. Northflank) also uses Cloudflare infrastructure.
         // We must NOT treat Cloudflare proxy IPs as an Error 1000 conflict.
 
         const hasCname = results.cname && results.cname.length > 0;
@@ -1975,7 +2536,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 
         if (hasCname) {
             // CNAME exists — DNS is verified. The A records (which follow the CNAME
-            // chain) will naturally resolve to Cloudflare IPs when the origin (Railway)
+            // chain) will naturally resolve to Cloudflare IPs when the origin (Northflank)
             // uses Cloudflare. This is expected, not a conflict.
             results.dnsVerified = true;
         } else if (hasCfIps) {
@@ -2016,11 +2577,11 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                                 const lower = body.toLowerCase();
                                 if (lower.includes('error 1000') || lower.includes('dns points to prohibited') || lower.includes('cname cross-user')) {
                                     resolve('error_1000');
-                                } else if (RAILWAY_NOT_FOUND_MARKERS.some(marker => lower.includes(marker))) {
-                                    // Railway's own "Not Found" page — the domain is NOT registered
-                                    // as a custom domain in the Railway service settings. Traffic
-                                    // reaches Railway via Cloudflare proxy but Railway rejects it.
-                                    resolve('railway_not_registered');
+                                } else if ((probeRes.statusCode === 404 || probeRes.statusCode === 503 || lower.includes('northflank')) && NORTHFLANK_NOT_FOUND_MARKERS.some(marker => lower.includes(marker))) {
+                                    // Northflank's own "Not Found" page — the domain is NOT registered
+                                    // as a custom domain in the Northflank Ports & DNS settings. Traffic
+                                    // reaches Northflank via Cloudflare proxy but Northflank rejects it.
+                                    resolve('northflank_not_registered');
                                 } else {
                                     resolve('cf_proxy_active');
                                 }
@@ -2040,25 +2601,25 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                 // still be unreachable, e.g. 522/521, but the CNAME+proxy setup is correct).
                 results.dnsVerified = true;
                 results.cloudflareProxied = true;
-            } else if (probeResult === 'railway_not_registered') {
-                // Cloudflare proxy is working but Railway returned its "Not Found" page.
-                // This means the domain is NOT added as a custom domain in Railway's
-                // service settings. Traffic reaches Railway but gets rejected.
+            } else if (probeResult === 'northflank_not_registered') {
+                // Cloudflare proxy is working but Northflank returned its "Not Found" page.
+                // This means the domain is NOT added as a custom domain in Northflank's
+                // Ports & DNS settings. Traffic reaches Northflank but gets rejected.
                 results.cloudflareProxied = true;
-                results.railwayNotRegistered = true;
-                results.railwayApiConfigured = isRailwayApiConfigured();
+                results.northflankNotRegistered = true;
+                results.northflankApiConfigured = isNorthflankApiConfigured();
 
-                // Attempt auto-registration with Railway if API is configured
-                if (isRailwayApiConfigured()) {
-                    const railwayResult = await registerDomainWithRailway(hostname);
-                    if (railwayResult && railwayResult.id) {
-                        await db.run('UPDATE custom_domains SET railwayDomainId = ? WHERE id = ?', [railwayResult.id, domain.id]);
-                        results.railwayAutoRegistered = true;
-                        results.railwayNotRegistered = false;
-                        results.dnsVerified = false; // Will be verified when user runs DNS check after Railway provisions routing
+                // Attempt auto-registration with Northflank if API is configured
+                if (isNorthflankApiConfigured()) {
+                    const northflankResult = await registerDomainWithNorthflank(hostname);
+                    if (northflankResult && northflankResult.id) {
+                        await db.run('UPDATE custom_domains SET northflankDomainId = ? WHERE id = ?', [northflankResult.id, domain.id]);
+                        results.northflankAutoRegistered = true;
+                        results.northflankNotRegistered = false;
+                        results.dnsVerified = false; // Will be verified when user runs DNS check after Northflank provisions routing
                         results.instructions.push(
-                            `✅ Domain "${hostname}" has been automatically registered with Railway!`,
-                            'Railway is now provisioning routing for this domain. This typically takes 1-2 minutes.',
+                            `✅ Domain "${hostname}" has been automatically registered with Northflank!`,
+                            'Northflank is now provisioning routing for this domain. This typically takes 1-2 minutes.',
                             'Click "Check DNS" again in a minute or two to verify the domain is fully active.'
                         );
                         await db.run(
@@ -2072,44 +2633,44 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 
                 // Auto-registration not available or failed — show manual instructions
                 results.dnsVerified = false;
-                if (isRailwayApiConfigured()) {
+                if (isNorthflankApiConfigured()) {
                     results.instructions.push(
-                        `⚠️ DOMAIN NOT REGISTERED WITH RAILWAY: Cloudflare proxy is routing traffic correctly, but Railway returned "Not Found" for "${hostname}".`,
-                        'Auto-registration with Railway failed. You can:',
+                        `⚠️ DOMAIN NOT REGISTERED WITH NORTHFLANK: Cloudflare proxy is routing traffic correctly, but Northflank returned "Not Found" for "${hostname}".`,
+                        'Auto-registration with Northflank failed. You can:',
                         '',
-                        '🔧 Option 1: Click the "Register with Railway" button below to retry.',
+                        '🔧 Option 1: Click the "Register with Northflank" button below to retry.',
                         '',
                         '🔧 Option 2: Register manually:',
-                        '1. Go to your Railway project dashboard → select your service → Settings → Networking → Custom Domain.',
-                        `2. Add "${hostname}" as a custom domain in Railway.`,
+                        '1. Go to your Northflank project dashboard → select your service → Ports & DNS → link domain.',
+                        `2. Add "${hostname}" as a custom domain in Northflank.`,
                         '3. After adding, come back here and click "Check DNS" again.'
                     );
                 } else {
                     results.instructions.push(
-                        `⚠️ DOMAIN NOT REGISTERED WITH RAILWAY: Cloudflare proxy is routing traffic correctly, but Railway returned "Not Found" for "${hostname}".`,
-                        'This means the domain is not added as a custom domain in your Railway service.',
+                        `⚠️ DOMAIN NOT REGISTERED WITH NORTHFLANK: Cloudflare proxy is routing traffic correctly, but Northflank returned "Not Found" for "${hostname}".`,
+                        'This means the domain is not added as a custom domain in your Northflank service.',
                         '',
                         '🔧 RECOMMENDED FIX — Set up automatic registration:',
-                        '1. Go to Railway dashboard → Account Settings → Tokens → Create Token.',
-                        '2. Add the token as RAILWAY_TOKEN in your Railway service environment variables.',
+                        '1. Go to Northflank dashboard → Account Settings → API Tokens → Create team token.',
+                        '2. Add the token as NORTHFLANK_API_TOKEN in your Northflank service environment variables.',
                         '3. Redeploy the service, then click "Check DNS" again — the domain will be registered automatically.',
                         '',
                         '🔧 ALTERNATIVE — Register manually:',
-                        '1. Go to your Railway project dashboard → select your service → Settings → Networking → Custom Domain.',
-                        `2. Add "${hostname}" as a custom domain in Railway.`,
+                        '1. Go to your Northflank project dashboard → select your service → Ports & DNS → link domain.',
+                        `2. Add "${hostname}" as a custom domain in Northflank.`,
                         '3. After adding, come back here and click "Check DNS" again.',
                         '',
-                        'Note: Custom domains must be added to BOTH Railway AND this dashboard to work properly.',
-                        'Railway handles routing, while this dashboard manages domain purpose (link vs web).'
+                        'Note: Custom domains must be added to BOTH Northflank AND this dashboard to work properly.',
+                        'Northflank handles routing, while this dashboard manages domain purpose (link vs web).'
                     );
                 }
 
                 await db.run(
                     'UPDATE custom_domains SET dnsVerified = 0, sslStatus = ? WHERE id = ?',
-                    ['railway_not_registered', domain.id]
+                    ['northflank_not_registered', domain.id]
                 );
 
-                results.sslStatus = 'railway_not_registered';
+                results.sslStatus = 'northflank_not_registered';
                 return res.json(results);
             } else if (probeResult === 'error_1000') {
                 // Confirmed Cloudflare Error 1000 — A record pointing to a prohibited IP
@@ -2153,7 +2714,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
         if (results.dnsVerified) {
             if (results.cloudflareProxied) {
                 // Cloudflare proxy is active — Cloudflare handles SSL at the edge.
-                // The origin cert (Railway's *.up.railway.app) won't match the custom domain,
+                // The origin cert (Northflank's *.code.run) won't match the custom domain,
                 // but that's expected and correct. End users always get a valid Cloudflare
                 // edge certificate for the proxied domain. Skip the cert identity check.
                 sslStatus = 'active';
@@ -2166,7 +2727,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                         // We connect without strict validation to check HTTPS availability, then
                         // inspect the certificate to see if it actually matches the hostname.
                         // This distinguishes "SSL active" from "HTTPS reachable but cert is wrong"
-                        // (e.g., Railway's *.up.railway.app cert served for a custom domain).
+                        // (e.g., Northflank's *.code.run cert served for a custom domain).
                         const sslReq = https.get(`https://${hostname}`, { timeout: 5000, rejectUnauthorized: false }, (sslRes) => {
                             sslRes.resume(); // Drain response to prevent memory leak
                             // Check if the certificate matches the hostname
@@ -2182,7 +2743,7 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                                         results.certMatch = true;
                                     } else {
                                         // HTTPS is reachable but certificate is for a different domain
-                                        // (e.g., *.up.railway.app instead of the custom domain)
+                                        // (e.g., *.code.run instead of the custom domain)
                                         results.sslReady = false;
                                         sslStatus = 'cert_mismatch';
                                         results.certMatch = false;
@@ -2248,12 +2809,12 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
                 '   When proxy is ON, Cloudflare provides a valid SSL certificate for your domain automatically.',
                 '3. Set SSL/TLS mode to "Full" (NOT "Full (Strict)") in Cloudflare SSL/TLS settings.',
                 '   "Full (Strict)" requires the origin server to have a certificate matching your domain,',
-                '   but Railway\'s default certificate covers *.up.railway.app only.',
+                '   but Northflank\'s default certificate covers *.code.run only.',
                 '4. After enabling the proxy, wait 1-2 minutes and run this DNS check again.',
                 '',
                 '🔧 FIX — If you are NOT using Cloudflare:',
-                '1. Add this custom domain directly in your Railway service settings → Custom Domains.',
-                '   Railway will provision a valid SSL certificate for it automatically.',
+                '1. Add this custom domain directly in your Northflank service → Ports & DNS.',
+                '   Northflank will provision a valid SSL certificate for it automatically.',
                 '2. Alternatively, use Cloudflare as your DNS provider with proxy enabled (recommended).'
             );
         } else if (results.cloudflareProxied && results.sslReady) {
@@ -2288,13 +2849,13 @@ app.get('/api/domains/:id/dns-check', apiLimiter, authenticateToken, async (req,
 app.delete('/api/domains/:id', apiLimiter, authenticateToken, async (req, res) => {
     try {
         const db = await getDb();
-        // Fetch the domain first to get the Railway domain ID for cleanup
-        const domain = await db.get('SELECT id, railwayDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
+        // Fetch the domain first to get the Northflank domain ID for cleanup
+        const domain = await db.get('SELECT id, hostname, northflankDomainId FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
         if (!domain) return res.status(404).json({ error: 'Domain not found' });
 
-        // Auto-unregister from Railway if we have a Railway domain ID
-        if (domain.railwayDomainId) {
-            await unregisterDomainFromRailway(domain.railwayDomainId);
+        // Auto-unregister from Northflank if we have a Northflank domain ID
+        if (domain.northflankDomainId) {
+            await unregisterDomainFromNorthflank(domain.northflankDomainId || domain.hostname);
         }
 
         await db.run('DELETE FROM custom_domains WHERE id = ? AND ownerId = ?', [req.params.id, req.user.id]);
@@ -2478,19 +3039,23 @@ app.post('/api/templates/validate', (req, res) => {
 });
 
 app.post('/api/templates/preview', optionalAuth, (req, res) => {
-    const { htmlContent, destinationUrl } = req.body;
+    const { htmlContent, destinationUrl, redirectDelay } = req.body;
 
     if (!htmlContent) {
         return res.status(400).json({ error: 'HTML content is required' });
     }
 
     try {
+        // redirectDelay is optional. The processor clamps to its own
+        // [MIN_REDIRECT_DELAY_MS, MAX_REDIRECT_DELAY_MS] range, so we just
+        // forward whatever the caller provides and let processTemplate
+        // validate. Defaults to 4000ms when omitted.
         const result = processTemplate(htmlContent, {
             destinationUrl: destinationUrl || 'https://example.com',
             linkId: 'preview-123',
             country: 'US',
             domain: req.get('host'),
-            redirectDelay: 1500,
+            redirectDelay: redirectDelay,
             injectRedirect: true
         });
 
@@ -2558,6 +3123,140 @@ app.get('/api/dns/cname-target', (req, res) => {
     res.json({ cnameTarget: getCnameTarget(req) });
 });
 
+// ==================== LINK SETTINGS UPDATE (Features 1, 2, 6, 7, 19) ====================
+// Single endpoint to update all per-link settings (max clicks, PIN, webhook,
+// active hours, cloaker profile). All fields are optional — undefined fields
+// are left unchanged; explicit null clears the value.
+app.patch('/api/links/:id/settings', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const link = await db.get('SELECT id, accessPin FROM links WHERE id = ? AND ownerId = ? AND deletedAt IS NULL', [req.params.id, req.user.id]);
+        if (!link) return res.status(404).json({ error: 'Link not found' });
+
+        const updates = [];
+        const values = [];
+        const body = req.body || {};
+
+        if ('maxClicks' in body) {
+            const v = body.maxClicks;
+            if (v === null || v === '' || v === undefined) {
+                updates.push('maxClicks = NULL');
+            } else {
+                const n = Number(v);
+                if (!Number.isFinite(n) || n < 0 || n > 1e9) {
+                    return res.status(400).json({ error: 'maxClicks must be a non-negative number' });
+                }
+                updates.push('maxClicks = ?'); values.push(Math.floor(n));
+            }
+        }
+        if ('expiresAt' in body) {
+            if (body.expiresAt === null || body.expiresAt === '') {
+                updates.push('expiresAt = NULL');
+            } else {
+                const d = new Date(body.expiresAt);
+                if (isNaN(d.getTime())) return res.status(400).json({ error: 'expiresAt must be a valid date' });
+                updates.push('expiresAt = ?'); values.push(d.toISOString());
+            }
+        }
+        if ('accessPin' in body) {
+            if (body.accessPin === null || body.accessPin === '') {
+                updates.push('accessPin = NULL');
+            } else {
+                try {
+                    const hash = await featuresExtra.hashAccessPin(body.accessPin);
+                    updates.push('accessPin = ?'); values.push(hash);
+                } catch (e) { return res.status(400).json({ error: e.message }); }
+            }
+        }
+        if ('webhookUrl' in body) {
+            if (body.webhookUrl === null || body.webhookUrl === '') {
+                updates.push('webhookUrl = NULL');
+            } else {
+                const u = String(body.webhookUrl).trim();
+                if (!/^https?:\/\//i.test(u)) return res.status(400).json({ error: 'webhookUrl must be http(s)' });
+                updates.push('webhookUrl = ?'); values.push(u);
+            }
+        }
+        if ('activeFromHour' in body || 'activeToHour' in body || 'activeTimezone' in body) {
+            const fromH = body.activeFromHour;
+            const toH = body.activeToHour;
+            const tz = body.activeTimezone;
+            const validHour = h => h === null || h === '' || h === undefined || (Number.isInteger(Number(h)) && Number(h) >= 0 && Number(h) <= 23);
+            if (!validHour(fromH) || !validHour(toH)) {
+                return res.status(400).json({ error: 'activeFromHour and activeToHour must be 0-23' });
+            }
+            if ('activeFromHour' in body) { updates.push('activeFromHour = ?'); values.push(fromH === '' || fromH === null ? null : Number(fromH)); }
+            if ('activeToHour'   in body) { updates.push('activeToHour = ?');   values.push(toH   === '' || toH   === null ? null : Number(toH)); }
+            if ('activeTimezone' in body) { updates.push('activeTimezone = ?'); values.push(tz ? String(tz).slice(0, 64) : null); }
+        }
+        if ('cloakerProfile' in body) {
+            const valid = ['fast', 'balanced', 'stealth', null, ''];
+            const v = body.cloakerProfile;
+            if (!valid.includes(v) && !(typeof v === 'string' && Object.keys(featuresExtra.CLOAKER_PRESETS).includes(v.toLowerCase()))) {
+                return res.status(400).json({ error: 'cloakerProfile must be fast, balanced, or stealth' });
+            }
+            updates.push('cloakerProfile = ?'); values.push(v ? String(v).toLowerCase() : null);
+        }
+        if ('singleUse' in body) {
+            updates.push('singleUse = ?'); values.push(body.singleUse ? 1 : 0);
+        }
+
+        if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(link.id);
+        await db.run(`UPDATE links SET ${updates.join(', ')} WHERE id = ?`, values);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(chalk.red('[LINK-SETTINGS]'), err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==================== USER WEBHOOK (account-level fallback for Feature 6) ====================
+app.patch('/api/me/webhook', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const url = req.body && req.body.webhookUrl;
+        if (url === null || url === '' || url === undefined) {
+            await db.run('UPDATE users SET webhookUrl = NULL WHERE id = ?', [req.user.id]);
+            return res.json({ success: true, webhookUrl: null });
+        }
+        if (!/^https?:\/\//i.test(String(url))) {
+            return res.status(400).json({ error: 'webhookUrl must be http(s)' });
+        }
+        await db.run('UPDATE users SET webhookUrl = ? WHERE id = ?', [String(url).trim(), req.user.id]);
+        res.json({ success: true, webhookUrl: String(url).trim() });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== DESTINATION RULES UPDATE (Feature 3) ====================
+// PATCH a single rotation row's targeting rules.
+app.patch('/api/links/:id/destinations/:destId/rules', apiLimiter, authenticateToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const link = await db.get('SELECT id FROM links WHERE id = ? AND ownerId = ? AND deletedAt IS NULL', [req.params.id, req.user.id]);
+        if (!link) return res.status(404).json({ error: 'Link not found' });
+        const dest = await db.get('SELECT id FROM link_destinations WHERE id = ? AND linkId = ?', [req.params.destId, link.id]);
+        if (!dest) return res.status(404).json({ error: 'Destination not found' });
+        let rules = req.body && req.body.rules;
+        if (rules === null || rules === '' || rules === undefined) {
+            await db.run('UPDATE link_destinations SET rules = NULL WHERE id = ?', [dest.id]);
+            return res.json({ success: true, rules: null });
+        }
+        // Validate: must be a JSON object with allowed keys
+        if (typeof rules === 'string') {
+            try { rules = JSON.parse(rules); } catch (e) { return res.status(400).json({ error: 'rules must be valid JSON' }); }
+        }
+        if (!rules || typeof rules !== 'object' || Array.isArray(rules)) {
+            return res.status(400).json({ error: 'rules must be a JSON object' });
+        }
+        const allowed = ['countries', 'deny_countries', 'devices', 'asnDeny', 'hours'];
+        const filtered = {};
+        for (const k of allowed) if (k in rules) filtered[k] = rules[k];
+        await db.run('UPDATE link_destinations SET rules = ? WHERE id = ?', [JSON.stringify(filtered), dest.id]);
+        res.json({ success: true, rules: filtered });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('*', (req, res) => {
     // Block dashboard access on link domain
     if (isLinkDomainRequest(req)) {
@@ -2565,6 +3264,155 @@ app.get('*', (req, res) => {
     }
     res.sendFile(path.join(__dirname, '../public', 'index.html'));
 });
+
+// ==================== STARTUP SELF-CHECK ====================
+// Asserts every critical exported handler used by routes is wired correctly.
+// Fails fast at boot rather than 500ing a real visitor.
+function runStartupSelfCheck() {
+    const required = [
+        ['linkStore', linkStore, ['getLink', 'getLinksForUser', 'logClick', 'getDashboardStats',
+            'getBotFeed', 'getHumanFeed', 'getTopThreats', 'getDomainHealth',
+            'getNextRotationUrl', 'createLinkWithRotations']],
+        ['botDetector', botDetector, null], // module export is the function itself
+        ['cloaker', cloaker, ['encryptPayload', 'decryptPayload', 'verifyChallenge', 'generateChallengePage']],
+        ['safeRedirectChain', safeRedirectChain, ['startChain', 'processHop']],
+        ['shortLinkManager', shortLinkManager, ['resolve', 'recordClick']],
+        ['fraudAnalyzer', fraudAnalyzer, null]
+    ];
+
+    const errors = [];
+    for (const [name, mod, methods] of required) {
+        if (!mod) {
+            errors.push(`Module '${name}' is not loaded.`);
+            continue;
+        }
+        if (methods === null) {
+            if (typeof mod !== 'function') {
+                errors.push(`Module '${name}' is expected to be a function but is ${typeof mod}.`);
+            }
+            continue;
+        }
+        for (const m of methods) {
+            if (typeof mod[m] !== 'function') {
+                errors.push(`Module '${name}' is missing method '${m}' (got ${typeof mod[m]}).`);
+            }
+        }
+    }
+
+    if (errors.length > 0) {
+        console.error(chalk.red('[SELF-CHECK] ✗ Wiring errors detected:'));
+        for (const e of errors) console.error(chalk.red('  - ' + e));
+        // In production: refuse to boot; in dev: warn loudly.
+        if (config.env === 'production') {
+            console.error(chalk.red('[SELF-CHECK] Refusing to start with broken wiring.'));
+            process.exit(1);
+        }
+    } else {
+        console.log(chalk.green('[SELF-CHECK] ✓ All critical handlers wired correctly.'));
+    }
+}
+runStartupSelfCheck();
+
+// ==================== BACKGROUND SCHEDULERS ====================
+// Disabled in test/smoke runs to keep tests deterministic.
+const SCHEDULERS_DISABLED = process.env.NODE_ENV === 'test';
+
+// Feature 13: Domain warmup / health auto-pause.
+// Every 5 minutes, scan custom_domains for any whose recent bot rate
+// exceeds the threshold; flip isActive=false on the links using that
+// domain and broadcast a WS event so the dashboard updates live.
+// Uses the same `bot_redirect_events` table the existing health endpoint reads.
+const DOMAIN_AUTOPAUSE_THRESHOLD = 0.85;       // 85% bot ratio
+const DOMAIN_AUTOPAUSE_MIN_HITS = 20;          // require enough sample size
+const DOMAIN_AUTOPAUSE_WINDOW_MIN = 15;        // last 15 minutes
+async function runDomainAutoPauseScan() {
+    try {
+        const db = await getDb();
+        // Constants are validated as integers at module scope; pass through
+        // bound parameters anyway so `db.all` always sees a parameterized query.
+        const windowMin = Number(DOMAIN_AUTOPAUSE_WINDOW_MIN) | 0;
+        const minHits = Number(DOMAIN_AUTOPAUSE_MIN_HITS) | 0;
+        const rows = await db.all(`
+            SELECT l.id, l.ownerId, l.domain,
+                   COUNT(c.id) as totalHits,
+                   SUM(CASE WHEN c.isBot = 1 THEN 1 ELSE 0 END) as botHits
+            FROM links l
+            LEFT JOIN clicks c ON c.linkId = l.id
+                AND c.timestamp >= datetime('now', ?)
+            WHERE l.isActive = 1 AND l.deletedAt IS NULL
+            GROUP BY l.id
+            HAVING totalHits >= ?
+        `, [`-${windowMin} minutes`, minHits]);
+        for (const r of rows) {
+            const ratio = r.totalHits > 0 ? (r.botHits || 0) / r.totalHits : 0;
+            if (ratio >= DOMAIN_AUTOPAUSE_THRESHOLD) {
+                await db.run('UPDATE links SET isActive = 0 WHERE id = ?', [r.id]);
+                console.log(chalk.red(`[AUTOPAUSE] Link ${r.id} paused (${Math.round(ratio*100)}% bot rate over ${DOMAIN_AUTOPAUSE_WINDOW_MIN}min)`));
+                if (r.ownerId) {
+                    broadcastToUser(r.ownerId, 'LINK_AUTOPAUSED', {
+                        linkId: r.id, botRatio: ratio, windowMinutes: DOMAIN_AUTOPAUSE_WINDOW_MIN,
+                        timestamp: Date.now()
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(chalk.yellow('[AUTOPAUSE] scan error:'), e.message);
+    }
+}
+
+// Feature 16: Click anomaly alerts (3σ deviation).
+// Every hour, for each active link, compute current-hour click count, update
+// rolling baseline, and if the count exceeds mean + 3σ, broadcast an alert.
+async function runAnomalyScan() {
+    try {
+        const db = await getDb();
+        const linkIds = await db.all(`
+            SELECT id, ownerId FROM links
+            WHERE deletedAt IS NULL AND isActive = 1
+        `);
+        for (const link of linkIds) {
+            const row = await db.get(
+                `SELECT COUNT(*) as c FROM clicks
+                 WHERE linkId = ?
+                   AND timestamp >= datetime('now', '-1 hour')
+                   AND isBot = 0`,
+                [link.id]
+            );
+            const count = (row && row.c) || 0;
+            // Detect BEFORE updating so a single huge hour can't poison its own baseline
+            const anomaly = await featuresExtra.detectAnomaly(link.id, count);
+            await featuresExtra.updateAnomalyBaseline(link.id, count);
+            if (anomaly && link.ownerId) {
+                // Throttle: don't alert more than once per 6h per link
+                const last = await db.get('SELECT lastAlertAt FROM link_anomaly_baselines WHERE linkId = ?', [link.id]);
+                const lastMs = last && last.lastAlertAt ? Date.parse(last.lastAlertAt) : 0;
+                if (Date.now() - lastMs > 6 * 60 * 60 * 1000) {
+                    broadcastToUser(link.ownerId, 'CLICK_ANOMALY', {
+                        linkId: link.id,
+                        zScore: Number(anomaly.z.toFixed(2)),
+                        currentHourCount: anomaly.currentHourCount,
+                        baseline: { mean: anomaly.mean, stddev: anomaly.stddev },
+                        timestamp: Date.now()
+                    });
+                    await db.run('UPDATE link_anomaly_baselines SET lastAlertAt = CURRENT_TIMESTAMP WHERE linkId = ?', [link.id]);
+                    console.log(chalk.magenta(`[ANOMALY] Link ${link.id} clicks=${count} z=${anomaly.z.toFixed(2)} -> alert sent`));
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(chalk.yellow('[ANOMALY] scan error:'), e.message);
+    }
+}
+
+if (!SCHEDULERS_DISABLED) {
+    // Stagger initial runs so they don't compete on startup
+    setTimeout(() => { runDomainAutoPauseScan(); }, 60 * 1000);
+    setInterval(runDomainAutoPauseScan, 5 * 60 * 1000);
+    setTimeout(() => { runAnomalyScan(); }, 90 * 1000);
+    setInterval(runAnomalyScan, 60 * 60 * 1000);
+    console.log(chalk.cyan('[SCHEDULER] Domain auto-pause (5min) and anomaly scan (1h) registered.'));
+}
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {

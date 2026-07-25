@@ -13,19 +13,47 @@ const chalk = require('chalk');
 
 // Configuration
 const CONFIG = {
-    // Characters used for short code generation (URL-safe)
+    // Charsets used for short code generation.
+    //
+    // Popular shorteners (bit.ly, t.co, goo.gl, tinyurl, is.gd, ow.ly, buff.ly,
+    // rebrand.ly, etc.) almost universally emit 6–8 character mixed-case
+    // alphanumeric slugs with no separators — that pattern is what every URL
+    // scanner / shortener-detection heuristic looks for. To avoid being
+    // classified as a "URL shortener" link we deliberately:
+    //   1. Use lowercase + digits only (no uppercase mix-case fingerprint)
+    //   2. Always start with a letter (avoids leading-digit shortener regex)
+    //   3. Emit two segments separated by a hyphen (looks like a content slug,
+    //      not a tracking shortener)
+    //   4. Use a longer total length than typical shorteners
+    LETTER_CHARSET: 'abcdefghijkmnpqrstuvwxyz', // dropped 'l' and 'o' for legibility
+    DIGIT_CHARSET:  '23456789',                  // dropped 0 and 1 for legibility
+    ALNUM_CHARSET:  'abcdefghijkmnpqrstuvwxyz23456789',
+
+    // Legacy charset retained for custom-alias validation (humans may use any
+    // alphanumeric + hyphen + underscore in their own aliases).
     CHARSET: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-    
-    // Default short code length
-    DEFAULT_CODE_LENGTH: 6,
-    
-    // Minimum and maximum code lengths
-    MIN_CODE_LENGTH: 4,
-    MAX_CODE_LENGTH: 20,
-    
+
+    // Default short code length — total characters across both segments.
+    // 10 chars (5+5) ≈ 24^10 ≈ 6.3e13 combinations: ample for collision
+    // resistance and clearly outside the 6–8 char shortener window.
+    DEFAULT_CODE_LENGTH: 10,
+
+    // Segment separator and split position.
+    SEGMENT_SEPARATOR: '-',
+    SEGMENT_SPLIT_AT: 5, // first 5 chars, hyphen, then remaining chars
+
+    // Minimum and maximum code lengths (excluding the hyphen).
+    MIN_CODE_LENGTH: 8,
+    MAX_CODE_LENGTH: 24,
+
+    // Custom-alias length bounds — humans pick their own slugs and a 4-char
+    // minimum has historically been allowed; preserved for backwards compat.
+    MIN_ALIAS_LENGTH: 4,
+    MAX_ALIAS_LENGTH: 32,
+
     // Maximum retry attempts for unique code generation
     MAX_GENERATION_ATTEMPTS: 10,
-    
+
     // Reserved slugs that cannot be used as aliases
     RESERVED_SLUGS: [
         'api', 'admin', 'dashboard', 'login', 'logout', 'register', 'signup',
@@ -33,28 +61,71 @@ const CONFIG = {
         'js', 'css', 'img', 'images', 'fonts', 'favicon', 'robots',
         's', 'short', 'go', 'l', 'link', 'u', 'url', 'r', 'redirect'
     ],
-    
+
     // URL validation regex
     URL_REGEX: /^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)$/i,
-    
+
     // Alias validation regex (alphanumeric, hyphens, underscores)
     ALIAS_REGEX: /^[a-zA-Z0-9_-]+$/
 };
 
 /**
- * Generates a cryptographically secure random short code
- * @param {number} length - Length of the code to generate
+ * Pick an unbiased random index into a charset using crypto.randomBytes.
+ * Rejection-sampling avoids modulo bias for charsets that don't divide 256.
+ * The bounded retry guards against pathological inputs (e.g. corrupt RNG)
+ * even though, with `max ≥ charsetLength`, the rejection probability per
+ * draw is always < 50% so this loop terminates almost surely in O(1).
+ */
+function _secureIndex(charsetLength) {
+    if (charsetLength <= 0 || charsetLength > 256) {
+        throw new Error('Invalid charset length');
+    }
+    const max = 256 - (256 % charsetLength);
+    for (let attempt = 0; attempt < 1000; attempt++) {
+        const b = crypto.randomBytes(1)[0];
+        if (b < max) return b % charsetLength;
+    }
+    // Practically unreachable (probability < 2^-1000): bail out loudly rather
+    // than spin forever if the underlying RNG is somehow broken.
+    throw new Error('Failed to obtain unbiased random index after 1000 attempts');
+}
+
+function _pickN(charset, n) {
+    let out = '';
+    for (let i = 0; i < n; i++) {
+        out += charset[_secureIndex(charset.length)];
+    }
+    return out;
+}
+
+/**
+ * Generates a cryptographically secure random short code that does NOT match
+ * popular shortener heuristics (mixed-case 6–8 char alphanumeric, no separator).
+ *
+ * Resulting pattern: `[a-z][a-z2-9]{4}-[a-z2-9]{4,}` (e.g. "qbnvr-7k9zm").
+ *
+ * @param {number} length - Total code length excluding the hyphen separator.
  * @returns {string}
  */
 function generateSecureCode(length = CONFIG.DEFAULT_CODE_LENGTH) {
-    const bytes = crypto.randomBytes(length);
-    let result = '';
-    
-    for (let i = 0; i < length; i++) {
-        result += CONFIG.CHARSET[bytes[i] % CONFIG.CHARSET.length];
+    if (typeof length !== 'number' || length < CONFIG.MIN_CODE_LENGTH) {
+        length = CONFIG.DEFAULT_CODE_LENGTH;
     }
-    
-    return result;
+    if (length > CONFIG.MAX_CODE_LENGTH) length = CONFIG.MAX_CODE_LENGTH;
+
+    // Always lead with a letter — clean URL and breaks shortener regexes that
+    // expect a digit-capable first character.
+    const head = CONFIG.LETTER_CHARSET[_secureIndex(CONFIG.LETTER_CHARSET.length)];
+
+    // Determine where to insert the hyphen.
+    const splitAt = Math.min(CONFIG.SEGMENT_SPLIT_AT, length - 2);
+    const firstSegLen = splitAt - 1; // already used 1 char for `head`
+    const secondSegLen = length - splitAt;
+
+    const firstSeg = head + _pickN(CONFIG.ALNUM_CHARSET, Math.max(0, firstSegLen));
+    const secondSeg = _pickN(CONFIG.ALNUM_CHARSET, Math.max(1, secondSegLen));
+
+    return `${firstSeg}${CONFIG.SEGMENT_SEPARATOR}${secondSeg}`;
 }
 
 /**
@@ -108,12 +179,12 @@ function validateAlias(alias) {
 
     const trimmedAlias = alias.trim(); // Removed toLowerCase() to allow case-sensitive custom aliases if desired
     
-    if (trimmedAlias.length < CONFIG.MIN_CODE_LENGTH) {
-        return { isValid: false, error: `Alias must be at least ${CONFIG.MIN_CODE_LENGTH} characters` };
+    if (trimmedAlias.length < CONFIG.MIN_ALIAS_LENGTH) {
+        return { isValid: false, error: `Alias must be at least ${CONFIG.MIN_ALIAS_LENGTH} characters` };
     }
     
-    if (trimmedAlias.length > CONFIG.MAX_CODE_LENGTH) {
-        return { isValid: false, error: `Alias cannot exceed ${CONFIG.MAX_CODE_LENGTH} characters` };
+    if (trimmedAlias.length > CONFIG.MAX_ALIAS_LENGTH) {
+        return { isValid: false, error: `Alias cannot exceed ${CONFIG.MAX_ALIAS_LENGTH} characters` };
     }
 
     if (!CONFIG.ALIAS_REGEX.test(trimmedAlias)) {

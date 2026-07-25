@@ -1,15 +1,63 @@
 /**
- * Bot Detector v5.0 (Hardened)
+ * Bot Detector v6.0 (Hardened+)
  * Multi-layer detection: UA patterns, HTTP headers, Sec-Fetch analysis,
  * email scanner signatures, prefetch detection, AI bot detection,
- * header entropy analysis, and client signals.
+ * header entropy analysis, client signals, JA3/TLS fingerprint hints,
+ * datacenter ASN scoring, and per-IP arrival velocity.
  */
 
-// Comprehensive list of bot/crawler/scanner signatures (all lowercase)
+// Safe config loading (tunable thresholds via config.botDetection)
+let _config = {};
+try {
+    _config = require('../config');
+} catch (e) { /* config not present in some test envs */ }
+
+const BOT_THRESHOLD = (_config.botDetection && _config.botDetection.threshold) || 50;
+const HIGH_CONFIDENCE_THRESHOLD = (_config.botDetection && _config.botDetection.highConfidenceThreshold) || 80;
+const DATACENTER_ASN = new Set(((_config.fraud && _config.fraud.datacenterAsn) || []));
+
+// ---------- Per-IP arrival velocity (in-memory sliding window) ----------
+// A real human does not click the same redirector >5 times in 10 seconds.
+// Scanner sandboxes that explore links via multiple URL variants will trip this.
+const VELOCITY_WINDOW_MS = 10 * 1000;
+const VELOCITY_THRESHOLD = 5;
+const VELOCITY_MAX_ENTRIES = 50000;
+const _ipHits = new Map(); // ip -> [timestamps]
+
+function _trackIpVelocity(ip) {
+    if (!ip) return 0;
+    const now = Date.now();
+    let arr = _ipHits.get(ip);
+    if (!arr) {
+        if (_ipHits.size >= VELOCITY_MAX_ENTRIES) {
+            // Drop oldest entry to bound memory
+            const firstKey = _ipHits.keys().next().value;
+            _ipHits.delete(firstKey);
+        }
+        arr = [];
+        _ipHits.set(ip, arr);
+    }
+    // Trim entries outside the window
+    while (arr.length && now - arr[0] > VELOCITY_WINDOW_MS) arr.shift();
+    arr.push(now);
+    return arr.length;
+}
+
+// Periodic cleanup
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, arr] of _ipHits) {
+        while (arr.length && now - arr[0] > VELOCITY_WINDOW_MS) arr.shift();
+        if (arr.length === 0) _ipHits.delete(ip);
+    }
+}, 60 * 1000).unref?.();
+
+// ---------- Substring patterns (matched with .includes) ----------
+// These are unambiguous tokens — they will not appear in a real-browser UA.
 const BOT_PATTERNS = [
-    // Generic bot tokens
+    // Generic bot tokens (unambiguous substrings)
     'bot', 'crawler', 'spider', 'scraper', 'checker', 'monitor',
-    'fetch/', 'scan', 'probe', 'index', 'archiv', 'harvest',
+    'fetch/', 'archiv', 'harvest',
     // HTTP Libraries & Tools
     'curl', 'wget', 'python', 'java/', 'java ', 'axios', 'got/', 'node-fetch', 'guzzle',
     'libwww', 'http_client', 'postman', 'insomnia', 'httpie', 'okhttp', 'jersey',
@@ -40,6 +88,11 @@ const BOT_PATTERNS = [
     'amazonbot', 'ai2bot', 'omgili', 'omgilibot',
     'iaskspider', 'friendlycrawler', 'timpibot', 'velenpublicwebcrawler',
     'webzio-extended', 'imagesiftbot', 'kangaroo bot',
+    // Newer AI / search crawlers
+    'meta-externalfetcher', 'applebot-extended', 'mistralai-user',
+    'phindbot', 'pangubot', 'cotoyogi', 'qwantify', 'seekr',
+    'internet-measurement', 'duckassistbot', 'pangu-crawler',
+    'novaact', 'youbot', 'zhipu',
     // Email Security Scanners (critical for email link protection)
     'barracuda', 'proofpoint', 'mimecast', 'messagelabs', 'forcepoint',
     'fireeye', 'trendmicro', 'sophos', 'symantec', 'norton', 'mcafee',
@@ -64,6 +117,26 @@ const BOT_PATTERNS = [
     'nuzzel', 'newsblur', 'feedly'
 ];
 
+// Word-boundary regex patterns — fired only when the token appears as a standalone
+// word (e.g. "scan" matches "scan/1.0" but NOT "indexedDB"). This eliminates
+// false-positives we used to get from substrings like "index" or "scan".
+const BOT_REGEX_PATTERNS = [
+    /\bscan(?:ner|ning)?\b/i,
+    /\bprobe\b/i,
+    /\bindexer\b/i,
+    /\b(?:auto|head)less\b/i,
+    /\b(?:python|java|ruby|perl|php|go)-(?:requests|http|urllib|httpclient)\b/i
+];
+
+// Email scanner-known referers — when these referers appear together with weak
+// browser signals it strongly indicates a link being followed by an email security
+// product rather than the human recipient.
+const SCANNER_REFERERS = [
+    'mail.google.com', 'outlook.live.com', 'outlook.office.com',
+    'mail.yahoo.com', 'mail.aol.com', 'mail.protonmail.com',
+    'mail.zoho.com', 'mail.proton.me', 'webmail.', 'safelinks.protection.outlook.com'
+];
+
 function detectBot(req, clientSignals = {}) {
     const ua = (req.headers['user-agent'] || '').toLowerCase();
     let score = 0;
@@ -82,6 +155,15 @@ function detectBot(req, clientSignals = {}) {
         if (ua.includes(pattern)) {
             score += 100;
             reasons.push(`Signature matched: ${pattern}`);
+            break;
+        }
+    }
+
+    // 2b. Word-boundary regex matches (avoids false positives from common substrings)
+    for (const re of BOT_REGEX_PATTERNS) {
+        if (re.test(ua)) {
+            score += 100;
+            reasons.push(`Regex bot signature: ${re.source}`);
             break;
         }
     }
@@ -264,12 +346,71 @@ function detectBot(req, clientSignals = {}) {
         reasons.push('Scanner timing header detected');
     }
 
+    // ====== Layer 6: Network/Infrastructure Signals ======
+
+    // 1. JA3 / TLS fingerprint hints (when behind Cloudflare or a CDN that exposes them)
+    // A blank or unusual JA3 from a "Mozilla" UA strongly suggests a non-browser client.
+    const tlsFp = req.headers['cf-ja3-hash'] || req.headers['cf-ja3'] || req.headers['x-tls-fingerprint'];
+    if (tlsFp && ua.includes('mozilla')) {
+        // Known curl/python/go default hashes — not exhaustive, but useful examples.
+        // Any short or empty hash with a real-browser UA is itself a strong signal.
+        const fp = String(tlsFp).toLowerCase();
+        const KNOWN_NON_BROWSER_JA3 = [
+            // common curl JA3 hashes (publicly documented)
+            '472d8e04f47cf1d5071dd0ff61cd0fbd', // curl
+            'e7d705a3286e19ea42f587b344ee6865', // curl alt
+            'a0e9f5d64349fb13191bc781f81f42e1', // python-requests
+            '54328bd36c14bd82ddaa0c04b25ed9ad'  // openssl/golang
+        ];
+        if (KNOWN_NON_BROWSER_JA3.includes(fp) || fp.length < 16) {
+            score += 60;
+            reasons.push('Non-browser TLS fingerprint');
+        }
+    }
+
+    // 2. Datacenter ASN — Cloudflare/CDN sets cf-ipcountry / cf-iplongitude;
+    // some setups also forward the source ASN. Also accept geoip-lite lookup result
+    // when the caller passes it in via clientSignals.geo (kept generic to avoid
+    // double-fetching geo here).
+    const asnHeader = req.headers['cf-asn'] || req.headers['x-ip-asn'];
+    const asn = parseInt(asnHeader, 10);
+    if (asn && DATACENTER_ASN.has(asn)) {
+        score += 35;
+        reasons.push(`Datacenter ASN ${asn}`);
+    }
+
+    // 3. Per-IP arrival velocity — too many requests in a short window
+    const ip = req.clientIp || req.ip || (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const velocityCount = _trackIpVelocity(ip);
+    if (velocityCount > VELOCITY_THRESHOLD) {
+        score += 30;
+        reasons.push(`High IP velocity (${velocityCount}/${VELOCITY_WINDOW_MS / 1000}s)`);
+    }
+
+    // 4. Email-scanner referer + no client-side JS execution — classic email scanner pattern.
+    // Real recipients click and load the page, so jsExecuted should be true on subsequent
+    // unlock submission. Initial GETs from scanner referers without any browser hints get flagged.
+    const referer = (req.headers['referer'] || req.headers['referrer'] || '').toLowerCase();
+    if (referer) {
+        const isScannerReferer = SCANNER_REFERERS.some(s => referer.includes(s));
+        if (isScannerReferer && !clientSignals.jsExecuted && !req.headers['sec-fetch-dest']) {
+            score += 35;
+            reasons.push('Email-scanner referer without browser hints');
+        }
+    }
+
+    // 5. Honeypot-flagged IP (set by upstream scanner-probe middleware in server.js)
+    if (req.headers['x-honeypot-flagged']) {
+        score += 80;
+        reasons.push('IP previously hit honeypot path');
+    }
+
     // Normalize score
     score = Math.max(0, Math.min(100, score));
 
-    // Strict thresholds: score >= 50 is treated as a bot
-    const isBot = score >= 50;
-    const confidence = score >= 80 ? 'high' : (score >= 50 ? 'medium' : 'low');
+    // Strict thresholds: configurable via config.botDetection.threshold (default 50)
+    const isBot = score >= BOT_THRESHOLD;
+    const confidence = score >= HIGH_CONFIDENCE_THRESHOLD ? 'high' : (score >= BOT_THRESHOLD ? 'medium' : 'low');
 
     return {
         isBot,
@@ -280,3 +421,6 @@ function detectBot(req, clientSignals = {}) {
 }
 
 module.exports = detectBot;
+// Expose internals for testing and dashboard introspection
+module.exports.BOT_THRESHOLD = BOT_THRESHOLD;
+module.exports.HIGH_CONFIDENCE_THRESHOLD = HIGH_CONFIDENCE_THRESHOLD;

@@ -13,7 +13,7 @@ const CACHE_TTL = {
 };
 
 const linkStore = {
-    async createLinkWithRotations({ ownerId, publicDomain, expiresAt, rotations, templateId }) {
+    async createLinkWithRotations({ ownerId, publicDomain, expiresAt, rotations, templateId, singleUse }) {
         const db = await getDb();
         
         const firstUrl = rotations[0]?.url;
@@ -23,11 +23,11 @@ const linkStore = {
 
         await db.run('BEGIN TRANSACTION');
         try {
-            // MODIFIED: Added templateId to the INSERT statement
+            // MODIFIED: Added templateId and singleUse to the INSERT statement
             await db.run(
-                `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId) 
-                 VALUES (?, ?, ?, ?, ?, 0, 0, ?)`,
-                [internalId, ownerId, googleAdsUrl, firstUrl, expiresAt, templateId]
+                `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, singleUse) 
+                 VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+                [internalId, ownerId, googleAdsUrl, firstUrl, expiresAt, templateId, singleUse ? 1 : 0]
             );
 
             for (const rotation of rotations) {
@@ -49,7 +49,8 @@ const linkStore = {
                 expiresAt, 
                 clicks: 0, 
                 botClicks: 0,
-                templateId
+                templateId,
+                singleUse: singleUse ? 1 : 0
             };
         } catch (error) {
             await db.run('ROLLBACK');
@@ -60,7 +61,9 @@ const linkStore = {
 
     async getLinksForUser(ownerId) {
         const db = await getDb();
-        return db.all('SELECT * FROM links WHERE ownerId = ? ORDER BY createdAt DESC', ownerId);
+        // Feature 18: hide soft-deleted links from default list (recycle bin
+        // surfaces them via /api/links/trash). One-line additive WHERE clause.
+        return db.all('SELECT * FROM links WHERE ownerId = ? AND deletedAt IS NULL ORDER BY createdAt DESC', ownerId);
     },
     
     async getRotationsForLink(linkId) {
@@ -131,20 +134,17 @@ const linkStore = {
         const link = await db.get('SELECT id FROM links WHERE id = ? AND ownerId = ?', [id, ownerId]);
         if (!link) throw new Error("Link not found or permission denied.");
 
-        await db.run('BEGIN TRANSACTION');
-        try {
-            await db.run('DELETE FROM link_destinations WHERE linkId = ?', id);
-            await db.run('DELETE FROM clicks WHERE linkId = ?', id);
-            await db.run('DELETE FROM links WHERE id = ?', id);
-            await db.run('COMMIT');
-            return true;
-        } catch (error) {
-            await db.run('ROLLBACK');
-            throw error;
-        }
+        // Feature 18: soft delete — set deletedAt rather than dropping rows.
+        // The recycle bin endpoint can restore within the retention window.
+        // Hard-delete remains available via DELETE FROM links once trash is purged.
+        const result = await db.run(
+            'UPDATE links SET deletedAt = CURRENT_TIMESTAMP WHERE id = ? AND ownerId = ? AND deletedAt IS NULL',
+            [id, ownerId]
+        );
+        return result.changes > 0;
     },
     
-    async logClick({ linkId, isBot, ipAddress, userAgent, country, referrer, destinationUrl }) {
+    async logClick({ linkId, isBot, ipAddress, userAgent, country, referrer, destinationUrl, botScore, botConfidence, botSignals }) {
         const db = await getDb();
         const isBotInt = isBot ? 1 : 0;
         const emoji = isBotInt ? '🤖' : '👤';
@@ -162,10 +162,23 @@ const linkStore = {
                 isUnique = existing ? 0 : 1;
             }
 
+            // Serialize bot signals safely (truncated to keep row size sane)
+            let signalsJson = null;
+            if (Array.isArray(botSignals) && botSignals.length > 0) {
+                try {
+                    const trimmed = botSignals.slice(0, 12).map(s => String(s).slice(0, 120));
+                    signalsJson = JSON.stringify(trimmed);
+                    if (signalsJson.length > 1024) signalsJson = signalsJson.slice(0, 1024);
+                } catch (_) { signalsJson = null; }
+            }
+
             await db.run(
-                `INSERT INTO clicks (linkId, isBot, ipAddress, userAgent, country, referrer, destinationUrl, timestamp, isUnique) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
-                [linkId, isBotInt, ipAddress, userAgent, country, referrer, destinationUrl, isUnique]
+                `INSERT INTO clicks (linkId, isBot, ipAddress, userAgent, country, referrer, destinationUrl, timestamp, isUnique, botScore, botConfidence, botSignals) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)`,
+                [linkId, isBotInt, ipAddress, userAgent, country, referrer, destinationUrl, isUnique,
+                 typeof botScore === 'number' ? botScore : 0,
+                 botConfidence || null,
+                 signalsJson]
             );
             
             if (isBotInt) {
@@ -217,7 +230,175 @@ const linkStore = {
             linkId
         );
         
-        return clicks.map(c => ({ ...c, isBot: c.isBot === 1, isUnique: c.isUnique === 1 }));
+        return clicks.map(c => ({
+            ...c,
+            isBot: c.isBot === 1,
+            isUnique: c.isUnique === 1,
+            botSignals: c.botSignals ? (() => { try { return JSON.parse(c.botSignals); } catch (_) { return []; } })() : []
+        }));
+    },
+
+    /**
+     * Recent bot click feed for the bot-feed dashboard panel.
+     * Returns the latest bot hits across all of the owner's links, with bot score,
+     * confidence, signals, and link metadata for display.
+     */
+    async getBotFeed(ownerId, limit = 100) {
+        const db = await getDb();
+        const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+        const rows = await db.all(`
+            SELECT c.id, c.linkId, c.timestamp, c.ipAddress, c.userAgent, c.country,
+                   c.referrer, c.botScore, c.botConfidence, c.botSignals,
+                   l.destinationUrlDesktop
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ? AND c.isBot = 1
+            ORDER BY c.timestamp DESC
+            LIMIT ?
+        `, [ownerId, safeLimit]);
+        return rows.map(r => ({
+            ...r,
+            botSignals: r.botSignals ? (() => { try { return JSON.parse(r.botSignals); } catch (_) { return []; } })() : []
+        }));
+    },
+
+    /**
+     * Recent verified-human click feed for the human conversions panel.
+     */
+    async getHumanFeed(ownerId, limit = 100) {
+        const db = await getDb();
+        const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+        const rows = await db.all(`
+            SELECT c.id, c.linkId, c.timestamp, c.ipAddress, c.userAgent, c.country,
+                   c.referrer, c.isUnique, c.destinationUrl,
+                   l.destinationUrlDesktop, l.tags
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ? AND c.isBot = 0
+            ORDER BY c.timestamp DESC
+            LIMIT ?
+        `, [ownerId, safeLimit]);
+        return rows.map(r => ({ ...r, isUnique: r.isUnique === 1 }));
+    },
+
+    /**
+     * Top threats summary — most-frequent bot UAs, countries, and signals over a period.
+     * Used by the dashboard "threats" panel.
+     */
+    async getTopThreats(ownerId, days = 7) {
+        const db = await getDb();
+        const safeDays = Math.max(1, Math.min(parseInt(days, 10) || 7, 90));
+
+        const topUserAgents = await db.all(`
+            SELECT
+                substr(c.userAgent, 1, 80) AS userAgent,
+                COUNT(*) AS hits
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ? AND c.isBot = 1
+              AND c.timestamp >= datetime('now', '-' || ? || ' days')
+              AND c.userAgent IS NOT NULL AND c.userAgent != ''
+            GROUP BY substr(c.userAgent, 1, 80)
+            ORDER BY hits DESC
+            LIMIT 10
+        `, [ownerId, safeDays]);
+
+        const topCountries = await db.all(`
+            SELECT c.country, COUNT(*) AS hits
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ? AND c.isBot = 1
+              AND c.timestamp >= datetime('now', '-' || ? || ' days')
+              AND c.country IS NOT NULL AND c.country != 'Unknown' AND c.country != ''
+            GROUP BY c.country
+            ORDER BY hits DESC
+            LIMIT 10
+        `, [ownerId, safeDays]);
+
+        // Aggregate signals from JSON arrays — done in JS since SQLite has no JSON_EACH guarantee here
+        const recent = await db.all(`
+            SELECT c.botSignals
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ? AND c.isBot = 1 AND c.botSignals IS NOT NULL
+              AND c.timestamp >= datetime('now', '-' || ? || ' days')
+            LIMIT 5000
+        `, [ownerId, safeDays]);
+        const signalCounts = {};
+        for (const row of recent) {
+            try {
+                const sigs = JSON.parse(row.botSignals);
+                if (Array.isArray(sigs)) {
+                    for (const s of sigs) {
+                        const k = String(s).slice(0, 80);
+                        signalCounts[k] = (signalCounts[k] || 0) + 1;
+                    }
+                }
+            } catch (_) { /* skip malformed */ }
+        }
+        const topSignals = Object.entries(signalCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 15)
+            .map(([signal, hits]) => ({ signal, hits }));
+
+        return {
+            period: `${safeDays} days`,
+            topUserAgents,
+            topCountries,
+            topSignals
+        };
+    },
+
+    /**
+     * Per-domain health snapshot for the dashboard.
+     * Reports total/bot click counts and a green/amber/red status per custom-domain.
+     * Status thresholds: <30% bots = green, 30–60% = amber, >60% = red.
+     */
+    async getDomainHealth(ownerId, days = 1) {
+        const db = await getDb();
+        const safeDays = Math.max(1, Math.min(parseInt(days, 10) || 1, 30));
+
+        // Group clicks by host extracted from googleAdsUrl/destinationUrl on the link.
+        // We use the link's googleAdsUrl as the proxy for "domain through which the click came".
+        const rows = await db.all(`
+            SELECT 
+                l.googleAdsUrl AS publicUrl,
+                SUM(CASE WHEN c.isBot = 1 THEN 1 ELSE 0 END) AS botClicks,
+                SUM(CASE WHEN c.isBot = 0 THEN 1 ELSE 0 END) AS humanClicks,
+                COUNT(*) AS totalClicks
+            FROM clicks c
+            JOIN links l ON c.linkId = l.id
+            WHERE l.ownerId = ?
+              AND c.timestamp >= datetime('now', '-' || ? || ' days')
+            GROUP BY l.googleAdsUrl
+        `, [ownerId, safeDays]);
+
+        // Aggregate by hostname
+        const byDomain = new Map();
+        for (const r of rows) {
+            let host = 'unknown';
+            try { host = new URL(r.publicUrl).hostname; } catch (_) {}
+            const cur = byDomain.get(host) || { domain: host, totalClicks: 0, botClicks: 0, humanClicks: 0 };
+            cur.totalClicks += r.totalClicks || 0;
+            cur.botClicks += r.botClicks || 0;
+            cur.humanClicks += r.humanClicks || 0;
+            byDomain.set(host, cur);
+        }
+        const domains = Array.from(byDomain.values()).map(d => {
+            const ratio = d.totalClicks > 0 ? d.botClicks / d.totalClicks : 0;
+            let status = 'green';
+            if (d.totalClicks >= 5) {
+                if (ratio > 0.6) status = 'red';
+                else if (ratio > 0.3) status = 'amber';
+            }
+            return {
+                ...d,
+                botRatio: parseFloat((ratio * 100).toFixed(1)),
+                status
+            };
+        }).sort((a, b) => b.totalClicks - a.totalClicks);
+
+        return { period: `${safeDays} days`, domains };
     },
 
     /**
@@ -354,7 +535,8 @@ const linkStore = {
         const searchTerm = `%${query}%`;
         return db.all(`
             SELECT * FROM links 
-            WHERE ownerId = ? 
+            WHERE ownerId = ?
+            AND deletedAt IS NULL
             AND (
                 destinationUrlDesktop LIKE ? 
                 OR tags LIKE ? 
@@ -373,27 +555,12 @@ const linkStore = {
         if (!linkIds || linkIds.length === 0) return 0;
 
         const placeholders = linkIds.map(() => '?').join(',');
-        
-        await db.run('BEGIN');
-        try {
-            await db.run(
-                `DELETE FROM link_destinations WHERE linkId IN (${placeholders})`,
-                linkIds
-            );
-            await db.run(
-                `DELETE FROM clicks WHERE linkId IN (${placeholders})`,
-                linkIds
-            );
-            const result = await db.run(
-                `DELETE FROM links WHERE id IN (${placeholders}) AND ownerId = ?`,
-                [...linkIds, ownerId]
-            );
-            await db.run('COMMIT');
-            return result.changes;
-        } catch (error) {
-            await db.run('ROLLBACK');
-            throw error;
-        }
+        // Feature 18: bulk soft-delete (was hard-delete) so deletes can be undone.
+        const result = await db.run(
+            `UPDATE links SET deletedAt = CURRENT_TIMESTAMP WHERE id IN (${placeholders}) AND ownerId = ? AND deletedAt IS NULL`,
+            [...linkIds, ownerId]
+        );
+        return result.changes;
     },
 
     /**
@@ -536,9 +703,10 @@ const linkStore = {
      * @param {string} options.expiresAt - Expiration datetime
      * @param {Array<{url: string, tags?: string, notes?: string}>} options.destinations - Array of destination URLs
      * @param {number} [options.templateId] - Optional template ID
+     * @param {boolean} [options.singleUse] - Optional single-use mode
      * @returns {Promise<{batchId: string, links: Array}>}
      */
-    async createBatchLinks({ ownerId, publicDomain, expiresAt, destinations, templateId }) {
+    async createBatchLinks({ ownerId, publicDomain, expiresAt, destinations, templateId, singleUse }) {
         const db = await getDb();
 
         if (!destinations || !Array.isArray(destinations) || destinations.length === 0) {
@@ -559,9 +727,9 @@ const linkStore = {
                 const { googleAdsUrl, internalId } = googleAdsRedirector.createRedirect(url, publicDomain);
 
                 await db.run(
-                    `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, batchId, tags, notes) 
-                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
-                    [internalId, ownerId, googleAdsUrl, url, expiresAt, templateId || null, batchId, dest.tags || null, dest.notes || null]
+                    `INSERT INTO links (id, ownerId, googleAdsUrl, destinationUrlDesktop, expiresAt, clicks, botClicks, templateId, batchId, tags, notes, singleUse) 
+                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`,
+                    [internalId, ownerId, googleAdsUrl, url, expiresAt, templateId || null, batchId, dest.tags || null, dest.notes || null, singleUse ? 1 : 0]
                 );
 
                 await db.run(
@@ -581,7 +749,8 @@ const linkStore = {
                     templateId: templateId || null,
                     batchId,
                     tags: dest.tags || null,
-                    notes: dest.notes || null
+                    notes: dest.notes || null,
+                    singleUse: singleUse ? 1 : 0
                 });
             }
 

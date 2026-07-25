@@ -205,6 +205,15 @@
                                 <span>Custom Domains</span>
                             </a>
                         </li>
+                        <li>
+                            <a href="#more-tools-section" class="nav-link">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="3"/>
+                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                                </svg>
+                                <span>More Tools</span>
+                            </a>
+                        </li>
                         <li id="admin-nav-item" style="display:none;">
                             <a href="#admin-section" class="nav-link">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -412,6 +421,66 @@
                     </div>
                 </div>
 
+                <!-- ==================== BOT DETECTION & THREATS PANELS ==================== -->
+                <div class="insights-grid">
+                    <!-- Bot Feed: latest blocked bots with reason chips -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🤖 Bot Detection Feed</h3>
+                            <button type="button" class="btn-icon-sm" id="refresh-bot-feed-btn" title="Refresh">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"/>
+                                    <polyline points="1 20 1 14 7 14"/>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+                                    <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="card-body scrollable-feed" id="bot-feed-body">
+                            <div class="empty-state-sm">No bot activity yet.</div>
+                        </div>
+                    </div>
+
+                    <!-- Human Conversions: recent verified humans -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>👤 Human Conversions</h3>
+                            <button type="button" class="btn-icon-sm" id="refresh-human-feed-btn" title="Refresh">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"/>
+                                    <polyline points="1 20 1 14 7 14"/>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+                                    <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="card-body scrollable-feed" id="human-feed-body">
+                            <div class="empty-state-sm">No human visits yet.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Top Threats + Domain Health -->
+                <div class="insights-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>⚠️ Top Threats (7d)</h3>
+                        </div>
+                        <div class="card-body" id="top-threats-body">
+                            <div class="empty-state-sm">Loading threat summary...</div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🛡️ Domain Health (24h)</h3>
+                        </div>
+                        <div class="card-body" id="domain-health-body">
+                            <div class="empty-state-sm">Loading domain health...</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Live Feed -->
                 <div class="card live-feed-card">
                     <div class="card-header">
@@ -563,6 +632,48 @@
                                 <div class="form-group">
                                     <label>Expiration</label>
                                     <input type="date" id="expires-at-input" required>
+                                </div>
+                                <div class="form-group">
+                                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                        <input type="checkbox" id="single-use-input" style="width: auto; margin: 0;">
+                                        <span>Bot Single-Hit Mode</span>
+                                    </label>
+                                    <div class="helper-text">Block subsequent bot/scanner probes after the first one is detected. Real humans always retain unlimited access.</div>
+                                </div>
+                                <!-- Feature 1, 2, 7, 19 — optional per-link controls. All blank ⇒ no-op. -->
+                                <div class="form-group">
+                                    <label>Click cap (max human clicks, optional)</label>
+                                    <input type="number" id="max-clicks-input" min="1" placeholder="e.g. 100">
+                                    <div class="helper-text">When reached, link returns the standard 404 page. Bots are not counted.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Access PIN (optional)</label>
+                                    <input type="text" id="access-pin-input" placeholder="leave blank to disable" autocomplete="off">
+                                    <div class="helper-text">Real humans see a small PIN form before the cloaker runs. Bots never see the prompt.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Cloaker profile</label>
+                                    <select id="cloaker-profile-input">
+                                        <option value="">Default (Balanced)</option>
+                                        <option value="fast">Fast (1.5s)</option>
+                                        <option value="balanced">Balanced (4s)</option>
+                                        <option value="stealth">Stealth (7s)</option>
+                                    </select>
+                                    <div class="helper-text">Tunes redirect delay and jitter. Leaving blank keeps current behavior.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Active hours (optional)</label>
+                                    <div style="display:flex;gap:.5rem;align-items:center">
+                                        <input type="number" id="active-from-input" min="0" max="23" placeholder="From (0-23)" style="width:120px">
+                                        <input type="number" id="active-to-input" min="0" max="23" placeholder="To (0-23)" style="width:120px">
+                                        <input type="text" id="active-tz-input" placeholder="UTC or IANA TZ" style="flex:1">
+                                    </div>
+                                    <div class="helper-text">Outside this window the link redirects to the global fallback URL.</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Click webhook URL (optional)</label>
+                                    <input type="url" id="webhook-url-input" placeholder="https://...">
+                                    <div class="helper-text">After a click is logged, a HMAC-signed POST is fired (fire-and-forget).</div>
                                 </div>
                             </div>
                         </div>
@@ -820,12 +931,28 @@
                             <div class="info-icon">ℹ️</div>
                             <div class="info-content">
                                 <strong>DNS Setup:</strong>
-                                Create a <strong>CNAME</strong> record pointing to <code id="cname-target-domains">loading...</code>
-                                <br><small><strong>⚠️ Important:</strong> Do NOT use an A record pointing to a Cloudflare IP (e.g., 104.16.x.x, 172.67.x.x). This causes Cloudflare Error 1000 ("DNS points to prohibited IP"). Always use a CNAME record pointing to your platform hostname (e.g., your-app.up.railway.app), NOT to another custom domain.</small>
+                                Create a <strong>CNAME</strong> record pointing to
+                                <code id="cname-target-domains">loading...</code>
+                                <button type="button" id="copy-cname-target-btn" class="btn-copy" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Copy CNAME target to clipboard">Copy</button>
+                                <button type="button" id="check-all-dns-btn" class="btn-secondary" style="margin-left:6px;padding:2px 10px;font-size:0.75rem;" title="Run DNS check for every connected domain">🔄 Check All</button>
+                                <br><small><strong>⚠️ Important:</strong> Do NOT use an A record pointing to a Cloudflare IP (e.g., 104.16.x.x, 172.67.x.x). This causes Cloudflare Error 1000 ("DNS points to prohibited IP"). Always use a CNAME record pointing to your platform hostname (e.g., your-service.code.run), NOT to another custom domain.</small>
                                 <br><small><strong>Link Domain:</strong> Used for generating cloaked links (does not expose dashboard). <strong>Web Domain:</strong> Used to access the engine dashboard.</small>
                                 <br><small><strong>SSL Options:</strong> Use Cloudflare (free) with "Full" or "Full (Strict)" SSL mode, or issue an SSL certificate through your domain registrar.</small>
-                                <br><small><strong>💡 Tip:</strong> If the CNAME target above shows "your-app.up.railway.app", set the <code>CNAME_TARGET</code> environment variable to your Railway hostname (e.g., <code>my-service-production.up.railway.app</code>).</small>
-                                <br><small><strong>🚂 Auto-Registration:</strong> Set <code>RAILWAY_TOKEN</code> env var to automatically register custom domains with Railway when you add them here. Generate a token at Railway dashboard → Account → Tokens.</small>
+                                <br><small><strong>💡 Tip:</strong> If the CNAME target above shows "your-service.code.run", set the <code>CNAME_TARGET</code> environment variable to your Northflank hostname (e.g., <code>my-service-production.code.run</code>).</small>
+                                <br><small><strong>🔗 Auto-Registration:</strong> Set <code>NORTHFLANK_API_TOKEN</code> env var to automatically register custom domains with Northflank when you add them here. Generate a token at Northflank dashboard → Account Settings → API Tokens.</small>
+                            </div>
+                        </div>
+
+                        <!-- DNS Check Result Panel: shows detailed instructions after a DNS check -->
+                        <div id="dns-check-panel" class="dns-info" hidden style="margin-top:12px;border-left:4px solid #3b82f6;">
+                            <div class="info-icon">🔍</div>
+                            <div class="info-content" style="flex:1;">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                                    <strong id="dns-check-title">DNS Check Results</strong>
+                                    <button type="button" id="dns-check-close-btn" class="btn-text" style="padding:0 6px;font-size:1rem;line-height:1;" title="Close">×</button>
+                                </div>
+                                <div id="dns-check-summary" style="font-size:0.85rem;margin-bottom:8px;"></div>
+                                <ul id="dns-check-instructions" style="margin:0;padding-left:20px;font-size:0.8rem;line-height:1.5;"></ul>
                             </div>
                         </div>
                     </div>
@@ -856,6 +983,105 @@
                 </div>
             </section>
 
+            <!-- ==================== MORE TOOLS SECTION (Features 4, 8, 11, 12, 14, 18, 19, 20) ==================== -->
+            <section id="more-tools-section" class="content-section" hidden>
+                <div class="section-header">
+                    <div class="header-title">
+                        <h1>More Tools</h1>
+                        <p>Bulk import, API keys, recycle bin, account export and more</p>
+                    </div>
+                </div>
+
+                <!-- CSV Bulk Import (Feature 8) -->
+                <div class="card">
+                    <h2>Bulk Import Links from CSV</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        CSV must include a <code>destinationUrl</code> column. Optional columns:
+                        <code>tags</code>, <code>notes</code>, <code>expiresAt</code>, <code>maxClicks</code>.
+                        File is parsed in your browser and posted to <code>/api/links/batch</code>.
+                    </p>
+                    <input type="file" id="csv-import-file" accept=".csv,text/csv">
+                    <button id="csv-import-btn" class="btn btn-primary" style="margin-left:.5rem">Import</button>
+                    <pre id="csv-import-result" style="margin-top:.75rem;white-space:pre-wrap;color:#374151;font-size:.85rem"></pre>
+                </div>
+
+                <!-- API Keys (Feature 11) -->
+                <div class="card">
+                    <h2>API Keys / Personal Access Tokens</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Use these tokens with <code>Authorization: Bearer rdr_…</code> to automate link creation
+                        without storing your password. The token is shown once on creation.
+                    </p>
+                    <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem">
+                        <input type="text" id="api-key-name" placeholder="Key name (e.g., zapier-prod)" style="flex:1;padding:.5rem;border:1px solid #d1d5db;border-radius:6px">
+                        <button id="api-key-create-btn" class="btn btn-primary">Create Key</button>
+                    </div>
+                    <div id="api-key-new" style="display:none;padding:.75rem;background:#fef3c7;border-radius:6px;margin-bottom:.75rem"></div>
+                    <table style="width:100%;border-collapse:collapse">
+                        <thead><tr><th style="text-align:left">Name</th><th>Prefix</th><th>Last Used</th><th>Created</th><th></th></tr></thead>
+                        <tbody id="api-keys-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Account Webhook (Feature 6 — account-level fallback) -->
+                <div class="card">
+                    <h2>Account-level Click Webhook</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Receive a signed POST after every click. The HMAC signature uses your JWT secret
+                        and is sent in the <code>X-Webhook-Signature</code> header. Per-link webhooks override this.
+                    </p>
+                    <div style="display:flex;gap:.5rem;align-items:center">
+                        <input type="url" id="account-webhook-url" placeholder="https://hooks.slack.com/..." style="flex:1;padding:.5rem;border:1px solid #d1d5db;border-radius:6px">
+                        <button id="account-webhook-save-btn" class="btn btn-primary">Save</button>
+                    </div>
+                </div>
+
+                <!-- Click Heatmap + Conversion Funnel (Feature 12) -->
+                <div class="card">
+                    <h2>Click Heatmap (last 30 days)</h2>
+                    <p style="color:#6b7280;font-size:.9rem">Day-of-week × hour-of-day human-click distribution.</p>
+                    <div id="heatmap-container" style="margin-top:.5rem"></div>
+                    <h2 style="margin-top:1.5rem">Conversion Funnel (last 7 days)</h2>
+                    <div id="funnel-container" style="margin-top:.5rem"></div>
+                </div>
+
+                <!-- Recycle Bin (Feature 18) -->
+                <div class="card">
+                    <h2>Recycle Bin</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Deleted links are kept here. Click "Restore" to undelete.
+                    </p>
+                    <button id="trash-refresh-btn" class="btn">Refresh</button>
+                    <table style="width:100%;border-collapse:collapse;margin-top:.75rem">
+                        <thead><tr><th style="text-align:left">Link</th><th>Destination</th><th>Deleted</th><th></th></tr></thead>
+                        <tbody id="trash-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Cloaker Presets help (Feature 19) -->
+                <div class="card">
+                    <h2>Cloaker Profiles</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0">
+                        Per-link redirect timing presets. Set on each link via the settings API
+                        (<code>PATCH /api/links/:id/settings</code> with <code>cloakerProfile</code>).
+                    </p>
+                    <pre id="cloaker-presets-display" style="font-size:.8rem;background:#f9fafb;padding:.5rem;border-radius:6px"></pre>
+                </div>
+
+                <!-- Account Export / Import (Feature 20) -->
+                <div class="card">
+                    <h2>Account Export / Import</h2>
+                    <p style="color:#6b7280;font-size:.9rem;margin:.25rem 0 .75rem">
+                        Download all your templates, short links and custom domains as JSON. Re-import
+                        into another account. Live tracking links are not included by design.
+                    </p>
+                    <button id="account-export-btn" class="btn">Download Export</button>
+                    <input type="file" id="account-import-file" accept="application/json,.json" style="margin-left:.5rem">
+                    <button id="account-import-btn" class="btn">Import</button>
+                    <pre id="account-import-result" style="margin-top:.5rem;font-size:.85rem;white-space:pre-wrap"></pre>
+                </div>
+            </section>
+
             <!-- ==================== ADMIN SECTION (Access Key Management) ==================== -->
             <section id="admin-section" class="content-section" hidden>
                 <div class="section-header">
@@ -879,6 +1105,22 @@
                                         <polyline points="22,6 12,13 2,6"/>
                                     </svg>
                                     <input type="email" id="target-email" placeholder="user@example.com" required>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="key-expiry-preset">Expires In</label>
+                                <select id="key-expiry-preset">
+                                    <option value="7">7 days</option>
+                                    <option value="30" selected>30 days</option>
+                                    <option value="90">90 days</option>
+                                    <option value="180">180 days</option>
+                                    <option value="365">1 year</option>
+                                    <option value="730">2 years</option>
+                                    <option value="custom">Custom…</option>
+                                </select>
+                                <div class="form-group" id="key-expiry-custom-wrapper" hidden style="margin-top:8px;">
+                                    <label for="key-expiry-days">Custom expiry (days, 1–3650)</label>
+                                    <input type="number" id="key-expiry-days" min="1" max="3650" step="1" placeholder="e.g. 45">
                                 </div>
                             </div>
                             <button type="submit" class="btn-primary">

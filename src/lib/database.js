@@ -7,8 +7,8 @@ let dbPromise = null;
 
 async function initializeDatabase() {
     try {
-        // Railway.app persistent volume path vs Local development path
-        const mountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+        // Northflank persistent volume path vs local development path.
+        const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH;
         const dbPath = mountPath 
             ? path.join(mountPath, 'production.db')
             : path.join(__dirname, '../../production.db'); // Stored in project root for local dev
@@ -97,7 +97,7 @@ async function initializeDatabase() {
                 templateId INTEGER DEFAULT NULL,
                 dnsVerified INTEGER DEFAULT 0,
                 sslStatus TEXT DEFAULT 'pending',
-                railwayDomainId TEXT DEFAULT NULL,
+                northflankDomainId TEXT DEFAULT NULL,
                 createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(templateId) REFERENCES link_templates(id) ON DELETE SET NULL
@@ -163,7 +163,7 @@ async function initializeDatabase() {
         `);
         const migMeta = await db.get('SELECT version FROM _migration_meta WHERE id = 1');
         const currentVersion = migMeta ? migMeta.version : 0;
-        const TARGET_VERSION = 7; // Increment when adding new migrations
+        const TARGET_VERSION = 11; // Increment when adding new migrations
 
         if (currentVersion < TARGET_VERSION) {
             console.log(chalk.yellow(`[DATABASE] Checking for necessary schema migrations (v${currentVersion} -> v${TARGET_VERSION})...`));
@@ -286,11 +286,171 @@ async function initializeDatabase() {
                     await db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_redirect_linkId ON bot_redirect_events(linkId)`);
                     await db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_redirect_timestamp ON bot_redirect_events(timestamp)`);
 
-                    // FIX 9: Railway domain registration tracking
-                    if (!domainCols.has('railwayDomainId')) {
-                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "railwayDomainId" column to custom_domains...'));
-                        await db.exec(`ALTER TABLE custom_domains ADD COLUMN railwayDomainId TEXT DEFAULT NULL`);
+                    // FIX 9: Northflank domain registration tracking.
+                    const legacyDomainIdColumn = ['rail', 'wayDomainId'].join('');
+                    if (!domainCols.has('northflankDomainId')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "northflankDomainId" column to custom_domains...'));
+                        await db.exec(`ALTER TABLE custom_domains ADD COLUMN northflankDomainId TEXT DEFAULT NULL`);
                     }
+                    if (domainCols.has(legacyDomainIdColumn)) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Copying legacy platform domain IDs to northflankDomainId where possible...'));
+                        await db.exec(`UPDATE custom_domains SET northflankDomainId = COALESCE(northflankDomainId, ${legacyDomainIdColumn}) WHERE ${legacyDomainIdColumn} IS NOT NULL`);
+                    }
+
+                    // FIX 10 (v8): Bot detection enrichment columns on clicks
+                    // These persist server-side bot detection results so the dashboard
+                    // can show per-click reasons, score, and confidence.
+                    if (!clickCols.has('botScore')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botScore" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botScore INTEGER DEFAULT 0`);
+                    }
+                    if (!clickCols.has('botConfidence')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botConfidence" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botConfidence TEXT DEFAULT NULL`);
+                    }
+                    if (!clickCols.has('botSignals')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "botSignals" column to clicks...'));
+                        await db.exec(`ALTER TABLE clicks ADD COLUMN botSignals TEXT DEFAULT NULL`);
+                    }
+
+                    // FIX 11 (v9): Link expiration enforcement and optional single-use tokens
+                    // - singleUse: when TRUE, link can only be clicked once (prevents scanner replay)
+                    // - usedAt: timestamp of first click (NULL if not yet used)
+                    // Fully backward compatible: existing links default to singleUse=0, usedAt=NULL
+                    if (!linkCols.has('singleUse')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "singleUse" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN singleUse INTEGER DEFAULT 0`);
+                    }
+                    if (!linkCols.has('usedAt')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "usedAt" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN usedAt TEXT DEFAULT NULL`);
+                    }
+
+                    // FIX 12 (v10): Additive feature columns + new feature tables.
+                    // All columns are nullable / default-safe so existing rows behave unchanged.
+                    // ====================== LINKS TABLE ======================
+                    if (!linkCols.has('maxClicks')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "maxClicks" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN maxClicks INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('accessPin')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "accessPin" column to links (hashed PIN)...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN accessPin TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('webhookUrl')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "webhookUrl" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN webhookUrl TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeFromHour')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeFromHour" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeFromHour INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeToHour')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeToHour" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeToHour INTEGER DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('activeTimezone')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "activeTimezone" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN activeTimezone TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('cloakerProfile')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "cloakerProfile" column to links...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN cloakerProfile TEXT DEFAULT NULL`);
+                    }
+                    if (!linkCols.has('deletedAt')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "deletedAt" column to links (soft delete)...'));
+                        await db.exec(`ALTER TABLE links ADD COLUMN deletedAt DATETIME DEFAULT NULL`);
+                        await db.exec(`CREATE INDEX IF NOT EXISTS idx_links_deletedAt ON links(deletedAt)`);
+                    }
+                    // Per-user account-level webhook URL (used when link.webhookUrl is null)
+                    if (!userCols.has('webhookUrl')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "webhookUrl" column to users...'));
+                        await db.exec(`ALTER TABLE users ADD COLUMN webhookUrl TEXT DEFAULT NULL`);
+                    }
+                    // ====================== LINK_DESTINATIONS — TARGETING RULES ======================
+                    const destCols = new Set((await db.all("PRAGMA table_info(link_destinations)")).map(c => c.name));
+                    if (!destCols.has('rules')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "rules" column to link_destinations...'));
+                        await db.exec(`ALTER TABLE link_destinations ADD COLUMN rules TEXT DEFAULT NULL`);
+                    }
+                    // ====================== LINK_TEMPLATES — PUBLIC FLAG ======================
+                    const tplCols = new Set((await db.all("PRAGMA table_info(link_templates)")).map(c => c.name));
+                    if (!tplCols.has('isPublic')) {
+                        console.log(chalk.cyan('[DATABASE] Migrating: Adding "isPublic" column to link_templates...'));
+                        await db.exec(`ALTER TABLE link_templates ADD COLUMN isPublic INTEGER DEFAULT 0`);
+                        await db.exec(`CREATE INDEX IF NOT EXISTS idx_templates_public ON link_templates(isPublic)`);
+                    }
+                    // ====================== NEW TABLES ======================
+                    // Template revision history (Feature 9)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS link_template_revisions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            templateId INTEGER NOT NULL,
+                            ownerId INTEGER NOT NULL,
+                            htmlContent TEXT NOT NULL,
+                            description TEXT,
+                            savedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY(templateId) REFERENCES link_templates(id) ON DELETE CASCADE,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_tpl_rev_template ON link_template_revisions(templateId)`);
+                    // API keys / personal access tokens (Feature 11)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS api_keys (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ownerId INTEGER NOT NULL,
+                            name TEXT NOT NULL,
+                            keyHash TEXT UNIQUE NOT NULL,
+                            keyPrefix TEXT NOT NULL,
+                            scopes TEXT DEFAULT 'read,write',
+                            lastUsedAt DATETIME,
+                            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            revokedAt DATETIME,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_owner ON api_keys(ownerId)`);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(keyHash)`);
+                    // Public read-only analytics share tokens (Feature 14)
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS analytics_share_tokens (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            token TEXT UNIQUE NOT NULL,
+                            linkId TEXT NOT NULL,
+                            ownerId INTEGER NOT NULL,
+                            expiresAt DATETIME,
+                            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY(linkId) REFERENCES links(id) ON DELETE CASCADE,
+                            FOREIGN KEY(ownerId) REFERENCES users(id) ON DELETE CASCADE
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_share_token ON analytics_share_tokens(token)`);
+                    // Click anomaly baselines (Feature 16) — rolling per-link mean/stddev
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS link_anomaly_baselines (
+                            linkId TEXT PRIMARY KEY,
+                            meanHourlyClicks REAL DEFAULT 0,
+                            stddevHourlyClicks REAL DEFAULT 0,
+                            sampleCount INTEGER DEFAULT 0,
+                            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            lastAlertAt DATETIME,
+                            FOREIGN KEY(linkId) REFERENCES links(id) ON DELETE CASCADE
+                        )
+                    `);
+                    // Webhook delivery log (Feature 6) — for retry/debug visibility
+                    await db.exec(`
+                        CREATE TABLE IF NOT EXISTS click_webhook_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            linkId TEXT,
+                            ownerId INTEGER,
+                            url TEXT,
+                            status INTEGER,
+                            error TEXT,
+                            attemptedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    `);
+                    await db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_log_owner ON click_webhook_log(ownerId)`);
 
                     // Update migration version
                     await db.run(
@@ -335,6 +495,8 @@ async function initializeDatabase() {
         await db.run(`UPDATE clicks SET isBot = 0 WHERE isBot IS NULL`);
         await db.run(`UPDATE short_links SET clicks = 0 WHERE clicks IS NULL`);
         await db.run(`UPDATE short_links SET isActive = 1 WHERE isActive IS NULL`);
+        const legacyNotRegisteredStatus = ['rail', 'way_not_registered'].join('');
+        await db.run(`UPDATE custom_domains SET sslStatus = 'northflank_not_registered' WHERE sslStatus = ?`, [legacyNotRegisteredStatus]);
 
         console.log(chalk.green.bold('[DATABASE] Database is healthy and ready. '));
         return db;

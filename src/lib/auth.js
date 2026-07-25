@@ -45,14 +45,25 @@ exports.validateAccessKey = async (key) => {
     return { id: user.id, email: user.username, role: user.role };
 };
 
-// Generate an access key for a target email (admin only)
-exports.generateAccessKey = async (requestorEmail, targetEmail) => {
+// Generate an access key for a target email (admin only).
+//
+// expiresInDays — optional, defaults to 30. Must be a finite positive number
+// in the range [1, 3650] (10 years). Using a single sanitization choke-point
+// here means the API layer doesn't have to duplicate validation.
+exports.generateAccessKey = async (requestorEmail, targetEmail, expiresInDays) => {
     if (requestorEmail !== config.adminEmail) {
         throw new Error('Forbidden: Only the admin can generate access keys.');
     }
+    let days = Number(expiresInDays);
+    if (!Number.isFinite(days) || days <= 0) {
+        days = 30;
+    }
+    // Clamp to a sensible upper bound; reject ridiculously large or fractional values
+    days = Math.min(Math.max(Math.floor(days), 1), 3650);
+
     const db = await getDb();
     const accessKey = crypto.randomBytes(32).toString('hex');
-    const keyExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const keyExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
     const role = targetEmail === config.adminEmail ? 'admin' : 'user';
 
     // Upsert: update if user exists, insert if not
@@ -69,5 +80,5 @@ exports.generateAccessKey = async (requestorEmail, targetEmail) => {
         );
     }
 
-    return { accessKey, expiresAt: keyExpiresAt };
+    return { accessKey, expiresAt: keyExpiresAt, expiresInDays: days };
 };

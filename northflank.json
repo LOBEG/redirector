@@ -1,0 +1,101 @@
+{
+  "apiVersion": "v1",
+  "spec": {
+    "kind": "Workflow",
+    "spec": {
+      "type": "sequential",
+      "steps": [
+        {
+          "kind": "BuildService",
+          "ref": "redirector-build",
+          "spec": {
+            "name": "redirector-build",
+            "tags": ["node", "express"],
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "vcsData": {
+              "projectUrl": "https://github.com/your-org/redirector",
+              "projectType": "github"
+            },
+            "buildSettings": {
+              "buildpack": {
+                "builder": "heroku/builder:24",
+                "buildContext": "/"
+              }
+            },
+            "buildConfiguration": {},
+            "disabledCI": false,
+            "buildArguments": {}
+          }
+        },
+        {
+          "kind": "Build",
+          "spec": {
+            "type": "service",
+            "id": "redirector-build",
+            "branch": "main"
+          }
+        },
+        {
+          "kind": "DeploymentService",
+          "spec": {
+            "name": "redirector",
+            "deployment": {
+              "instances": 1,
+              "internal": {
+                "id": "redirector-build",
+                "branch": "main",
+                "buildSHA": "latest"
+              },
+              "volumes": [
+                {
+                  "name": "data",
+                  "mountPath": "/data",
+                  "size": 1
+                }
+              ],
+              "healthChecks": {
+                "readiness": {
+                  "protocol": "HTTP",
+                  "path": "/health",
+                  "portName": "p01",
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 10
+                }
+              }
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "ports": [
+              {
+                "name": "p01",
+                "internalPort": 10000,
+                "public": true,
+                "protocol": "HTTP",
+                "security": {
+                  "credentials": [],
+                  "policies": []
+                },
+                "domains": [],
+                "disableNfDomain": false
+              }
+            ],
+            "runtimeEnvironment": {
+              "NODE_ENV": "production",
+              "PORT": "10000",
+              "NORTHFLANK_VOLUME_MOUNT_PATH": "/data"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "name": "Redirector Northflank service",
+  "description": "Buildpack-based Node.js/Express redirector service template. Update vcsData.projectUrl, branch, billing plan, and dashboard health check settings for your Northflank project.",
+  "project": {
+    "id": "redirector"
+  },
+  "$schema": "https://api.northflank.com/v1/schemas/template"
+}

@@ -214,7 +214,10 @@ router.post('/tr/v2/challenge', async (req, res) => {
             userAgent: req.headers['user-agent'] || 'unknown',
             country: country,
             referrer: req.headers.referer || 'Direct',
-            destinationUrl: finalUrl
+            destinationUrl: finalUrl,
+            botScore: detection.score,
+            botConfidence: detection.confidence,
+            botSignals: detection.signals
         });
         
         if (logResult) {

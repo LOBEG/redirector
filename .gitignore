@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+.DS_Store
+production.db
+production.db-shm
+production.db-wal
+*.sqlite
+*.sqlite3
